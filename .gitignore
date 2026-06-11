@@ -1,0 +1,46 @@
+# === 设计文档与论文（本地保留，不进仓） ===
+docs/
+PANTHER*.pdf
+*.pdf
+
+# === 完整原始数据集（仅仓内保留 <10MB 切片） ===
+data_source/Online Retail.xlsx
+data_source/online_retail.xlsx
+data_source/creditcard.csv
+# 允许仓内的切片（<10MB）显式追踪
+!data_source/Online_Retail_sample.xlsx
+!data_source/creditcard_sample.csv
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# === 虚拟环境 ===
+.venv/
+venv/
+env/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === Test / coverage ===
+.pytest_cache/
+.coverage
+htmlcov/
