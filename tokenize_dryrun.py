@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-TXNS = HERE / "data_sample" / "txns.parquet"
+TXNS_DEFAULT = HERE / "data_sample" / "txns.parquet"
 
 # 可解释 token 字面量（docs/03 §7）
 DIR_NAME = {0: "PUR", 1: "RED"}
@@ -39,11 +39,12 @@ def _bin_quantile(s: pd.Series, n_bins: int = 16) -> pd.Series:
     return bins.fillna(-1).astype(int).map(lambda x: f"A{int(x):02d}")
 
 
-def main(top_k: int = 20000) -> int:
-    if not TXNS.exists():
-        print(f"未找到 {TXNS}，请先运行 build_demo_data.py")
+def main(top_k: int = 20000, txns_path: Path = TXNS_DEFAULT) -> int:
+    if not txns_path.exists():
+        print(f"未找到 {txns_path}，请先运行 build_demo_data.py 或 fetch_fund_flow.py")
         return 2
-    df = pd.read_parquet(TXNS)
+    df = pd.read_parquet(txns_path)
+    print(f"=== 数据源: {txns_path.name} ({len(df):,} 行) ===")
 
     # ============================================================
     # 关键设计修正（dry-run 第一版发现）
@@ -135,4 +136,9 @@ def main(top_k: int = 20000) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--txns", type=Path, default=TXNS_DEFAULT,
+                    help="输入 txns parquet 路径（默认 data_sample/txns.parquet；真实ETF用 txns_real.parquet）")
+    args = ap.parse_args()
+    raise SystemExit(main(txns_path=args.txns))
