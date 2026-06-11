@@ -11,6 +11,9 @@ data_source/creditcard.csv
 !data_source/Online_Retail_sample.xlsx
 !data_source/creditcard_sample.csv
 
+# === 数据工程中间产物（脚本可重新生成，不进仓） ===
+data_processed/
+
 # === Python ===
 __pycache__/
 *.py[cod]

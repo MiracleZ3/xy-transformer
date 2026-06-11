@@ -72,11 +72,16 @@ def main(top_k: int = 20000, txns_path: Path = TXNS_DEFAULT) -> int:
     )
 
     # 8 维对照（仅作 ablation 展示，证明过度分解的危害）
+    # channel 不一定存在（docs/03 §1 已把它移出 token，作为画像分量；preprocess 不再产出）
     df["dt_token"] = _bin_quantile(np.log1p(df["dt_prev_sec"].clip(lower=0)), n_bins=8)
     df["hr_token"] = _bin_quantile(df["hour_bin"].astype(float), n_bins=8)
+    if "channel" in df.columns:
+        chan_str = df["channel"].map(CH_NAME).fillna("UNK").astype(str) + "_"
+    else:
+        chan_str = pd.Series(["NA_"] * len(df))
     df["tau_8dim"] = (
         df["tau_pure"] + "_"
-        + df["channel"].map(CH_NAME).fillna("UNK").astype(str) + "_"
+        + chan_str
         + "D" + df["dow"].astype(str) + "_"
         + df["hr_token"].astype(str) + "_"
         + df["dt_token"].astype(str)
