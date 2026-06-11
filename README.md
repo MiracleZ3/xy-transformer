@@ -47,5 +47,3 @@ python3 tokenize_dryrun.py      # 分词覆盖率与序列打包报告
 ## License
 
 MIT
-
-<!-- ci-verify: credential helper end-to-end check -->
