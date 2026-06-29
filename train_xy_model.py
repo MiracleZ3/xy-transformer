@@ -311,10 +311,12 @@ def train_and_eval(train_samples, val_samples, test_samples,
 
     best_val = float("inf")
     best_state = None
+    history = []   # 每条：{epoch, train_loss, val_loss}
     for ep in range(epochs):
         tr = run_epoch(train_samples, train=True)
         vl = run_epoch(val_samples, train=False)
         sched.step()
+        history.append({"epoch": ep + 1, "train_loss": tr, "val_loss": vl})
         if vl < best_val:
             best_val = vl
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -347,7 +349,7 @@ def train_and_eval(train_samples, val_samples, test_samples,
                 pids_pred.extend([s["product_id"] for s in batch])
         return preds, truths, nets_truth, dates, pids_pred
 
-    return model, predict(test_samples), pid2idx
+    return model, predict(test_samples), pid2idx, history
 
 
 # ============================================================
@@ -455,7 +457,7 @@ def main():
 
     print("\n==== 3. 训练 Transformer + SPRM 模型 ====")
     t0 = time.time()
-    model, (preds, truths, nets_truth, dates, pids_pred), pid2idx = train_and_eval(
+    model, (preds, truths, nets_truth, dates, pids_pred), pid2idx, history = train_and_eval(
         train_s, val_s, test_s, epochs=30, lr=1e-3, batch_size=32
     )
     print(f"  训练耗时: {time.time() - t0:.1f}s")
@@ -487,7 +489,28 @@ def main():
         json.dump({"summary": summary,
                    "n_train": len(train_s), "n_val": len(val_s), "n_test": len(test_s),
                    "device": DEVICE, "model_dim": 128, "epochs": 30}, f, ensure_ascii=False, indent=2)
-    print(f"\n>> 评估结果已写到 {OUT_DIR / 'eval_summary.json'}")
+
+    # 额外产物：训练曲线 + 逐样本预测（供画图复用）
+    with open(OUT_DIR / "training_history.json", "w", encoding="utf-8") as f:
+        json.dump({"history": history, "elapsed_sec": time.time() - t0}, f, ensure_ascii=False, indent=2)
+    pred_dump = []
+    for i in range(len(test_s)):
+        pred_dump.append({
+            "product_id": pids_pred[i],
+            "date": str(dates[i]),
+            "truth_net_log1p_h1": truths[1][i],  "pred_transf_h1": preds[1][i],
+            "truth_net_log1p_h7": truths[7][i],  "pred_transf_h7": preds[7][i],
+            "truth_net_log1p_h30": truths[30][i],"pred_transf_h30": preds[30][i],
+            "truth_net_raw_h1": nets_truth[1][i],
+            "truth_net_raw_h7": nets_truth[7][i],
+            "truth_net_raw_h30": nets_truth[30][i],
+        })
+    pd.DataFrame(pred_dump).to_parquet(OUT_DIR / "test_predictions.parquet", index=False)
+
+    print(f"\n>> 落盘完成:")
+    print(f"   - {OUT_DIR / 'eval_summary.json'}        指标汇总")
+    print(f"   - {OUT_DIR / 'training_history.json'}     每 epoch loss")
+    print(f"   - {OUT_DIR / 'test_predictions.parquet'}  逐样本预测（用于画图）")
     return 0
 
 
