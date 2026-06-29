@@ -1,0 +1,28 @@
+{
+  "9K73101A": {
+    "product_type_name": "固收",
+    "product_type_id": 1,
+    "risk_level": 2,
+    "min_holding_days": 180,
+    "is_t0": 0,
+    "annualized_yield": 0.01922,
+    "benchmark": "2%~3.8% 年化基准",
+    "mu_amount_log": 9.8,
+    "sigma_amount": 1.2,
+    "monthly_txn_rate": 60,
+    "p_redemption_base": 0.3
+  },
+  "9T32001A": {
+    "product_type_name": "固收",
+    "product_type_id": 1,
+    "risk_level": 2,
+    "min_holding_days": 30,
+    "is_t0": 0,
+    "annualized_yield": 0.02303,
+    "benchmark": "AAA 科创债×20% + 中债新综合 1-3y×80%",
+    "mu_amount_log": 9.3,
+    "sigma_amount": 1.0,
+    "monthly_txn_rate": 120,
+    "p_redemption_base": 0.35
+  }
+}

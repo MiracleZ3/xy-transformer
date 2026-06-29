@@ -47,3 +47,6 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# === 训练输出（脚本可重新生成，不进仓） ===
+model_out/
