@@ -9,7 +9,7 @@
     "benchmark": "2%~3.8% 年化基准",
     "mu_amount_log": 9.8,
     "sigma_amount": 1.2,
-    "monthly_txn_rate": 60,
+    "monthly_txn_rate": 30,
     "p_redemption_base": 0.3
   },
   "9T32001A": {
@@ -22,7 +22,7 @@
     "benchmark": "AAA 科创债×20% + 中债新综合 1-3y×80%",
     "mu_amount_log": 9.3,
     "sigma_amount": 1.0,
-    "monthly_txn_rate": 120,
+    "monthly_txn_rate": 75,
     "p_redemption_base": 0.35
   }
 }
