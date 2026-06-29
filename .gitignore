@@ -3,13 +3,10 @@ docs/
 PANTHER*.pdf
 *.pdf
 
-# === 完整原始数据集（仅仓内保留 <10MB 切片） ===
-data_source/Online Retail.xlsx
-data_source/online_retail.xlsx
-data_source/creditcard.csv
-# 允许仓内的切片（<10MB）显式追踪
-!data_source/Online_Retail_sample.xlsx
-!data_source/creditcard_sample.csv
+# === 原始数据集（本地保留，不进仓） ===
+# data_source/ 全部原始数据（全量 + 切片）均不进仓，避免仓库膨胀。
+# 需要时按 README 自行下载到 data_source/，或重跑 simulate_*.py 生成本地副本。
+data_source/
 
 # === 数据工程中间产物（脚本可重新生成，不进仓） ===
 data_processed/
