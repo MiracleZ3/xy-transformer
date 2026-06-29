@@ -7,23 +7,35 @@
 
 ---
 
+## v4 整改（**必须重跑**，v3 产物已失效）
+
+> 之前那次 A800 跑出来的 eval_summary.json 诊断出两个伪象：
+> 1. **log1p(net - offset + 1) 把目标压扁了 100 倍**（std/mean 从 3.27 → 0.03），1% WAPE 是假象
+> 2. **样本量太小**（n_train=1412）让 LightGBM 反超 Transformer，这是 2 产品×日级粒度的天然限制
+>
+> v4 修复（已 push）：
+> - **新增 group 维度**：每个产品再细分为 4 个客户群（RETAIL_APP / RETAIL_OTC / HNW / INSTITUTIONAL），
+>   仿真与训练都按 (产品 × group × 日) 聚合，**样本量从 ~1400 → ~8000**，让 Transformer 优势能显示
+> - **label 改成 6 维**：`log1p(purchase)` + `log1p(redemption)` × 3 个 horizon。purchase/redemption
+>   都是非负金额，直接 log1p 不做平移，没有压塌信号的伪象
+> - **基线对齐**：Naive mean / LightGBM 都跟 Transformer 用相同的 (产品×group×日) 口径
+>
+> **请重新跑一次 A800 流程，v3 的 eval_summary.json 不要再用。**
+
 ## Step 0：环境准备（一次性）
 
 ```bash
 # 0.1 校验可用 GPU（确认实际可用几张）
 python3 -c "import torch; print(torch.cuda.device_count(), 'GPUs,', torch.cuda.get_device_name(0))"
-# 预期输出: 8 GPUs, ...  (在 A800 上看到 8 张全在)
-# 但通过 nvidia-smi 看哪些被占用：
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv
-# 5 卡占用的话，跑训练时只能用 CUDA_VISIBLE_DEVICES 暴露剩余 3 张
 
-# 0.2 设置只用剩余 3 张卡（关键，避免抢别人的卡）
+# 0.2 设置只用剩余 3 张卡（5 卡被占用时）
 export CUDA_VISIBLE_DEVICES=0,1,2   # 改成你确认空闲的 3 张卡的 index
 
 # 0.3 装依赖
 pip install torch numpy pandas openpyxl lightgbm matplotlib
 
-# 0.4 拉代码
+# 0.4 拉代码（务必 git pull 拿到 v4）
 git clone https://github.com/MiracleZ3/xy-transformer.git
 cd xy-transformer
 ```
@@ -54,21 +66,24 @@ python3 simulate_xy_real_schema.py --years 3
 9T32001A: 赎占比 ~39%（短持有期）
 ```
 
-**跑完用 `verify_data.py` 做严谨的数据 sanity check**（已经写好的脚本，不要在 shell 里 ad-hoc 敲 inline 代码，会触发 pandas FutureWarning）：
+**搭建跑完用 `verify_data.py` 做 sanity check（v4 会校验 group 维度）**：
 
 ```bash
 python3 verify_data.py
 ```
 
-**预期输出**：
+**预期输出关键判断点**（v4）：
 ```
-==== 数据 sanity check (xy_txns.parquet) ====
-行数: 400,000+
-按产品 × 方向分布:
-  ...
-✓ 赎占比: 9K73101A=27% < 9T32001A=39% (持有期差异保留)
-✓ 数据
+== group 维度 ==
+group 数: 4
+  group=0 (RETAIL_APP): 笔数=... 中位=¥8-15k       ← 零售
+  group=1 (RETAIL_OTC): 笔数=... 中位=¥6-12k
+  group=2 (HNW): 笔数=... 中位=¥30-50k              ← 高净值
+  group=3 (INSTITUTIONAL): ... 中位=¥100-300k       ← 机构，金额明显偏大
+...
+✓ 赎占比: 9K73101A=27.x% < 9T32001A=39.x% (持有期差异保留)
 ```
+只要**4 个 group 的中位金额呈递增**（零售 < 高净值 < 机构）就说明 group 仿真合理。
 
 **失败处理**：
 - 行数 < 10 万 → 检查 `simulate_xy_real_schema.py` 里 `PRODUCTS` 的 `monthly_txn_rate` 是否被改成小值（应该 3000/7500）

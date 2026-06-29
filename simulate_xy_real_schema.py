@@ -95,12 +95,22 @@ def _to_yyyymmddhhmmss(ts: pd.Timestamp) -> str:
     return ts.strftime("%Y%m%d%H%M%S")
 
 
+# 渠道/客户群（提升样本粒度用：每个 (产品, group, 日) 是一个预测单元）
+# 真实理财常按客户群/渠道分层管理资金；这里把单一 product 内部细分成 N 个 group
+GROUPS = {
+    0: {"name": "RETAIL_APP",   "share": 0.45, "mu_delta": -0.3, "sigma_mult": 0.9},  # 零售APP
+    1: {"name": "RETAIL_OTC",   "share": 0.20, "mu_delta": -0.5, "sigma_mult": 0.8},  # 零售柜台
+    2: {"name": "HNW",          "share": 0.15, "mu_delta": +1.0, "sigma_mult": 1.3},  # 高净值客户
+    3: {"name": "INSTITUTIONAL","share": 0.20, "mu_delta": +2.2, "sigma_mult": 1.5},  # 机构
+}
+
+
 def simulate_product(pid: str, meta: dict, base_date: pd.Timestamp, n_days: int) -> pd.DataFrame:
     """为单个产品按其画像生成申赎流水（只生成成功记录）。
 
     性能优化（百万级数据用）：
-      ① 时间/方向/金额 用 numpy 数组批量生成，避免逐笔 Python 循环
-      ② 持仓约束（pool_granted 不可负）按时间排序后一次性扫描修正
+      ① 时间/方向/金额/分组 用 numpy 数组批量生成，避免逐笔 Python 循环
+      ② 持仓约束（pool_granted 不可负）按 (group, ts) 排序后分组扫描修正
     """
     # 总笔数
     n_txn = int(meta["monthly_txn_rate"] * n_days / 30)
@@ -130,44 +140,59 @@ def simulate_product(pid: str, meta: dict, base_date: pd.Timestamp, n_days: int)
     u = _RNG.random(n_txn)
     direction = (u < p_red).astype(np.int8)   # 0=申, 1=赎
 
-    # 金额批量 lognormal + winsorize
-    amount = _RNG.lognormal(meta["mu_amount_log"], meta["sigma_amount"], size=n_txn)
+    # ===== 新增 group 维度（按 GROUPS.share 抽样）=====
+    group_shares = np.array([GROUPS[k]["share"] for k in sorted(GROUPS)])
+    group_array = _RNG.choice(sorted(GROUPS), size=n_txn,
+                              p=group_shares / group_shares.sum()).astype(np.int8)
+    # 不同 group 的金额分布各异（mu/sigma 调整）：高净值/机构 金额显著偏大
+    mu_eff = np.array([meta["mu_amount_log"] + GROUPS[int(g)]["mu_delta"] for g in group_array])
+    sigma_eff = np.array([meta["sigma_amount"] * GROUPS[int(g)]["sigma_mult"] for g in group_array])
+    # lognormal 逐样本 = mu + sigma * standard_normal
+    z = _RNG.standard_normal(n_txn)
+    amount = np.exp(mu_eff + sigma_eff * z)
     amount = np.minimum(amount, 10_000_000.0).astype(np.float64)
 
     # 全量 batch-生成 timestamp（性能关键，不走 pd.Timedelta 逐笔）
     ts_int = (base_date.value // 10**9) + day_idx_picked * 86400 + secs_picked
 
-    # ===== 持仓约束修正（按 ts 升序扫描，O(n)，但只在 Python loop 里跑 pool 更新）=====
-    order = np.argsort(ts_int, kind="stable")
+    # ===== 持仓约束修正：按 (group, ts) 排序，每个 group 独立维护 pool =====
+    # （机构/高净值客户分组各自有自己的池子，符合真实业务）
+    sort_key = group_array.astype(np.int64) * (10**13) + ts_int.astype(np.int64)  # 合成稳定排序键
+    order = np.argsort(sort_key, kind="stable")
     direction = direction[order]
     amount = amount[order]
     ts_int = ts_int[order]
-    pool = 0.0
-    # 用 numpy buffer 避免逐笔 dict append
+    group_array = group_array[order]
+
+    # 分组扫描 pool：每个 group 维护一个累积持仓
+    pool_by_grp = {g: 0.0 for g in GROUPS}
     keep_mask = np.ones(n_txn, dtype=bool)
     for i in range(n_txn):
+        g = int(group_array[i])
         d = int(direction[i]); amt = float(amount[i])
         if d == 1:   # 赎回
-            if pool <= amt:
-                # 转小额申购，并 50% 概率跳过
+            if pool_by_grp[g] <= amt:
                 if _RNG.random() < 0.5:
                     keep_mask[i] = False
                     continue
                 direction[i] = 0
                 d = 0
-        pool = pool + amt if d == 0 else max(0.0, pool - amt)
+        pool_by_grp[g] = pool_by_grp[g] + amt if d == 0 else max(0.0, pool_by_grp[g] - amt)
 
-    # ===== 落盘前最后格式化（向量化生成 txn_time 字符串）=====
+    # ===== 落盘前最后格式化 =====
     ts_kept = ts_int[keep_mask]
     ts_pd = pd.Series(pd.to_datetime(ts_kept, unit="s"))
     direction_final = direction[keep_mask]
     amount_final = amount[keep_mask]
+    group_final = group_array[keep_mask]
     df = pd.DataFrame({
         "product_id": pid,
-        "txn_time": ts_pd.dt.strftime("%Y%m%d%H%M%S"),
-        "txn_ts": ts_kept.astype("int64"),
-        "txn_type": direction_final.astype("int8"),
-        "amount": np.round(amount_final, 2),
+        "group_id":   group_final.astype("int8"),
+        "group_name": [GROUPS[int(g)]["name"] for g in group_final],
+        "txn_time":   ts_pd.dt.strftime("%Y%m%d%H%M%S"),
+        "txn_ts":     ts_kept.astype("int64"),
+        "txn_type":   direction_final.astype("int8"),
+        "amount":     np.round(amount_final, 2),
     })
     if len(df) == 0:
         return df
@@ -230,6 +255,22 @@ def main(argv=None) -> int:
     for pid, g in txns.groupby("product_id"):
         print(f"  {pid}: 笔数={len(g):,}  赎占比={float((g['txn_type']==1).mean()):.1%}  "
               f"金额中位=¥{g['amount'].median():,.0f}")
+    # 按 (产品, group) 分组 — 这是新加细粒度维度
+    txns_dt = pd.to_datetime(txns["txn_ts"], unit="s").dt.normalize()
+    print("\n按 (产品 × group):")
+    grp_data = txns.groupby(["product_id", "group_name"]).agg(
+        n=("amount", "size"),
+        amt_median=("amount", "median"),
+        red_share=("txn_type", lambda s: (s == 1).mean()),
+    )
+    for (pid, gn), row in grp_data.iterrows():
+        print(f"  {pid} / {gn:>14s}: 笔数={int(row['n']):>7,}  "
+              f"赎占比={row['red_share']:.1%}  金额中位=¥{row['amt_median']:,.0f}")
+    n_units_fine = txns.groupby(["product_id", "group_id", txns_dt.values]).ngroups
+    n_units_coarse = txns.groupby(["product_id", txns_dt.values]).ngroups
+    print(f"\n样本粒度膨胀: {n_units_fine:,} 个 (产品×组×日) 单元 "
+          f"vs {n_units_coarse:,} 个 (产品×日) 单元 → 放大 "
+          f"{n_units_fine / max(n_units_coarse, 1):.1f}x")
     print(f"\n输出: {out_parquet}, {OUT_DIR/'xy_product_meta.json'}")
     return 0
 

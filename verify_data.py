@@ -32,7 +32,16 @@ def main(argv=None) -> int:
     print(f"行数: {len(df):,}")
     print(f"列: {list(df.columns)}")
     print(f"产品 ID: {sorted(df['product_id'].unique())}")
-    print(f"时间跨度: {df['txn_ts'].min()} -> {df['txn_ts'].max()}")
+
+    # ★ v4: group 维度校验
+    if "group_id" in df.columns:
+        print(f"\n== group 维度（细粒度维度，决定样本量量级）==")
+        print(f"group 数: {df['group_id'].nunique()}")
+        for gid, gg in df.groupby("group_id"):
+            name = gg["group_name"].iloc[0] if "group_name" in gg.columns else f"G{gid}"
+            print(f"  group={gid} ({name}): 笔数={len(gg):,}  中位=¥{gg['amount'].median():,.0f}")
+
+    print(f"\n时间跨度: {df['txn_ts'].min()} -> {df['txn_ts'].max()}")
 
     # 用 groupby + 标量聚合（不用 apply，避免 FutureWarning）
     print("\n按产品 × 方向分布:")

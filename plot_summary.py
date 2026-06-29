@@ -52,11 +52,13 @@ def _load_jsonl(path):
 
 
 def _is_converged(summary):
-    """粗略判断训练是否收敛：Transformer 的 +1d WAPE 应该 <= Naive mean。"""
+    """v4: 粗略判断训练收敛——Transformer 的 申购+1d WAPE 应该 <= Naive mean 的同口径值。"""
     try:
-        transf = summary["Transformer"]["1"]["WAPE"]["mean"]
-        naive = summary["Naive mean"]["1"]["WAPE"]["mean"]
-        return transf <= naive * 1.5   # 给 1.5x 容差，否则强判定未收敛
+        kh = "purchase_log1p|1"
+        transf = summary["Transformer"][kh]["WAPE"]["mean"]
+        naive = summary["Naive mean"][kh]["WAPE"]["mean"]
+        # 给 1.5x 容差也是"收敛可用"；若 Transformer 反超 1.5x 则标未收敛
+        return transf <= naive * 1.5
     except Exception:
         return None
 
@@ -186,7 +188,7 @@ def fig3():
 
 
 # ============================================================
-# Fig 4: 基线对比（带误差棒） + 相对提升 + 散点
+# Fig 4: 基线对比（带误差棒）— v4: 分申/赎两路 × 3 horizon
 # ============================================================
 def fig4():
     if not EVAL_PATH.exists():
@@ -194,83 +196,48 @@ def fig4():
     data = json.loads(EVAL_PATH.read_text(encoding="utf-8"))
     s = data["summary"]; n_seeds = data.get("n_seeds", "?")
     converged = _is_converged(s)
-    fig = plt.figure(figsize=(13.5, 4.8))
-    gs = fig.add_gridspec(1, 3, width_ratios=[1.0, 0.9, 1.0])
-    ax1 = fig.add_subplot(gs[0])
-    ax2 = fig.add_subplot(gs[1])
-    ax3 = fig.add_subplot(gs[2])
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8))
 
-    methods = [m for m in ["Naive mean", "LightGBM", "Transformer"] if m in s]
-    horizons = ["1", "7", "30"]
-
-    # (a) WAPE 分组柱 + 误差棒
-    width = 0.25; x = np.arange(len(horizons))
-    for i, m in enumerate(methods):
-        means = [s[m][h]["WAPE"]["mean"] for h in horizons]
-        stds  = [s[m][h]["WAPE"]["std"] for h in horizons]
-        ax1.bar(x + (i - 1) * width, means, width, yerr=stds, capsize=4,
-                color=METHOD_COLORS.get(m, "#888"),
-                edgecolor="black", linewidth=0.5,
-                label=m, error_kw={"elinewidth": 1.0, "ecolor": "black"})
-        for j, (mu, sd) in enumerate(zip(means, stds)):
-            ax1.text(x[j] + (i - 1) * width, mu + sd + max(means)*0.02,
-                     f"{mu*100:.2f}%", ha="center", fontsize=8)
-    ax1.set_xticks(x); ax1.set_xticklabels([f"+{h}天" for h in horizons])
-    ax1.set_ylabel("WAPE（越低越好）")
-    ax1.set_title(f"图4a  WAPE 对比\n({n_seeds} seeds 均值 ± std, 误差棒)")
-    ax1.legend(fontsize=8, loc="upper right")
-    ymin = min(s[m][h]["WAPE"]["mean"] for m in methods for h in horizons)
-    ymax = max(s[m][h]["WAPE"]["mean"] + s[m][h]["WAPE"]["std"]
-               for m in methods for h in horizons)
-    ax1.set_ylim(max(0, ymin * 0.9), ymax * 1.15)
-    ax1.grid(alpha=0.3, axis="y")
-
-    # (b) 相对提升：Transformer vs LightGBM (%)
-    if "LightGBM" in s and "Transformer" in s:
-        improvements = []
-        for h in horizons:
-            lgb_m = s["LightGBM"][h]["WAPE"]["mean"]
-            transf_m = s["Transformer"][h]["WAPE"]["mean"]
-            improvements.append((lgb_m - transf_m) / lgb_m * 100)
-        bars = ax2.bar([f"+{h}天" for h in horizons], improvements,
-                       color=["#3182bd" if v > 0 else "#d62728" for v in improvements],
-                       edgecolor="black", linewidth=0.5)
-        for b, v in zip(bars, improvements):
-            ax2.text(b.get_x() + b.get_width() / 2,
-                     v + (1.5 if v > 0 else -1.5),
-                     f"{v:+.1f}%", ha="center",
-                     va="bottom" if v > 0 else "top", fontweight="bold")
-        ax2.axhline(0, color="black", linewidth=0.6)
-        ax2.set_ylabel("相对 LightGBM 提升 %")
-        ax2.set_title("图4b  Transformer 相对 LightGBM\n(正=优于基线)")
-        ax2.grid(alpha=0.3, axis="y")
-    else:
-        ax2.text(0.5, 0.5, "无 LightGBM 基线", ha="center", transform=ax2.transAxes)
-        ax2.set_axis_off()
-
-    # (c) 预测散点
-    if PRED_PATH.exists():
-        pred = pd.read_parquet(PRED_PATH)
-        ax3.scatter(pred["truth_log1p_h1"], pred["pred_log1p_h1"], alpha=0.45,
-                    s=18, c=pred["product_id"].map(PRODUCT_COLORS))
-        lo = min(pred["truth_log1p_h1"].min(), pred["pred_log1p_h1"].min())
-        hi = max(pred["truth_log1p_h1"].max(), pred["pred_log1p_h1"].max())
-        ax3.plot([lo, hi], [lo, hi], color="red", linestyle="--",
-                 linewidth=1.2, label="完美预测 y=x")
-        for pid, c in PRODUCT_COLORS.items():
-            ax3.scatter([], [], c=c, label=pid)
-        ax3.set_xlabel("真实 log1p(+1d 净额)"); ax3.set_ylabel("Transformer 预测")
-        ax3.set_title("图4c  +1d 预测散点")
-        ax3.legend(fontsize=8, loc="upper left"); ax3.grid(alpha=0.3)
-    else:
-        ax3.text(0.5, 0.5, "无 test_predictions", ha="center", transform=ax3.transAxes)
-        ax3.set_axis_off()
+    for ax_idx, (kind, kind_label) in enumerate(
+        [("purchase_log1p", "申购 PURCHASE"), ("redemption_log1p", "赎回 REDEMPTION")]
+    ):
+        ax = axes[ax_idx]
+        methods = [m for m in ["Naive mean", "LightGBM", "Transformer"] if m in s]
+        horizons = [1, 7, 30]
+        width = 0.25; x = np.arange(len(horizons))
+        for i, m in enumerate(methods):
+            means, stds = [], []
+            for h in horizons:
+                kh = f"{kind}|{h}"
+                w = s[m].get(kh, {}).get("WAPE", {})
+                means.append(w.get("mean", float("nan")))
+                stds.append(w.get("std", 0))
+            if any(np.isnan(v) for v in means):
+                continue
+            ax.bar(x + (i - 1) * width, means, width, yerr=stds, capsize=4,
+                   color=METHOD_COLORS.get(m, "#888"),
+                   edgecolor="black", linewidth=0.5, label=m,
+                   error_kw={"elinewidth": 1.0, "ecolor": "black"})
+            for j, (mu, sd) in enumerate(zip(means, stds)):
+                ax.text(x[j] + (i - 1) * width, mu + sd + max(means) * 0.02,
+                        f"{mu*100:.1f}%", ha="center", fontsize=8)
+        ax.set_xticks(x); ax.set_xticklabels([f"+{h}天" for h in horizons])
+        ax.set_ylabel("WAPE (越低越好)")
+        ax.set_title(f"图4{'ab'[ax_idx]}  {kind_label}  WAPE 对比\n({n_seeds} seeds mean ± std)")
+        ax.legend(fontsize=8, loc="upper right")
+        all_means = [s[m].get(f"{kind}|{h}", {}).get("WAPE", {}).get("mean", 1.0)
+                     for m in methods for h in horizons]
+        all_stds = [s[m].get(f"{kind}|{h}", {}).get("WAPE", {}).get("std", 0)
+                    for m in methods for h in horizons]
+        ymax = max((m + sd) for m, sd in zip(all_means, all_stds) if not np.isnan(m))
+        ax.set_ylim(0, ymax * 1.18)
+        ax.grid(alpha=0.3, axis="y")
 
     # 未收敛警告 stamp
     if converged is False:
         fig.text(0.5, 0.02,
                  "[警告] 训练未收敛（mini 烟雾测试产物）—— 不可作为最终结论，"
-                 "需在 A800×8 上跑全量训练再下结论",
+                 "需在 A800×8 上跑全量训练",
                  ha="center", color="red", fontsize=10, fontweight="bold")
 
     plt.tight_layout(); plt.savefig(ASSETS / "fig4_eval_comparison.png",
@@ -278,9 +245,35 @@ def fig4():
     print("✓ fig4_eval_comparison.png")
 
 
+# ============================================================
+# Fig 5: 预测散点（v4: 申购 + 赎回 两套）
+# ============================================================
+def fig5():
+    if not PRED_PATH.exists():
+        print("[skip] test_predictions.parquet 不存在"); return
+    pred = pd.read_parquet(PRED_PATH)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, (kind, lab) in zip(axes, [("pur", "申购"), ("red", "赎回")]):
+        col_t = f"truth_{kind}_log1p_h1"; col_p = f"pred_{kind}_log1p_h1"
+        ax.scatter(pred[col_t], pred[col_p], alpha=0.5, s=22,
+                   c=pred["product_id"].map(PRODUCT_COLORS))
+        lo = min(pred[col_t].min(), pred[col_p].min())
+        hi = max(pred[col_t].max(), pred[col_p].max())
+        ax.plot([lo, hi], [lo, hi], color="red", linestyle="--",
+                linewidth=1.2, label="完美预测 y=x")
+        for pid, c in PRODUCT_COLORS.items():
+            ax.scatter([], [], c=c, label=pid)
+        ax.set_xlabel(f"真实 log1p({lab} +1d)"); ax.set_ylabel("Transformer 预测")
+        ax.set_title(f"图5  {lab} +1d 预测散点")
+        ax.legend(fontsize=8, loc="upper left"); ax.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(ASSETS / "fig5_pred_scatter.png",
+                                    dpi=140, bbox_inches="tight"); plt.close()
+    print("✓ fig5_pred_scatter.png")
+
+
 if __name__ == "__main__":
     print("生成插图...")
-    fig1(); fig2(); fig3(); fig4()
+    fig1(); fig2(); fig3(); fig4(); fig5()
     print(f"\n>> 输出目录: {ASSETS}")
     for p in sorted(ASSETS.glob("*.png")):
         print(f"   {p.name}  ({p.stat().st_size / 1024:.0f} KB)")

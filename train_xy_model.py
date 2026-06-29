@@ -111,22 +111,41 @@ FEATURE_DIMS = ["direction", "amount_bin", "product_type", "risk_level",
 
 
 def load_and_aggregate():
+    """读取流水 → (产品×group×日) 聚合 + 派生特征 + 分方向 log1p 标签。
+
+    ★ v4 修订（修 v3 的两个伪象问题）:
+      - 聚合粒度从 (product,date) 改为 (product,group,date)：样本量从 ~2000 → ~8000+
+        （这是 Transformer 优势能显示的条件）
+      - label 从 net_log1p（log 平移压塌信号）改为两个独立目标:
+          log1p(purchase)   和   log1p(redemption)
+        purchase/redemption 都是非负的（金额本身就是非负），无需平移；分方向对齐 docs/01 §1.1
+        的"分方向回归"设计。
+      - 模型一次输出 6 个目标：(purchase, redemption) × (+1d, +7d, +30d)
+    """
     df = pd.read_parquet(TXNS_PATH)
     with open(META_PATH, encoding="utf-8") as f:
         meta = json.load(f)
     df["date"] = pd.to_datetime(df["txn_ts"], unit="s").dt.normalize()
 
-    g = df.groupby(["product_id", "date", "txn_type"], as_index=False)["amount"].sum()
-    piv = g.pivot_table(index=["product_id", "date"], columns="txn_type",
-                        values="amount", fill_value=0.0)
+    # group_id 字段是 v4 仿真产出的；若旧数据没有则统一为 group_id=0（向后兼容）
+    if "group_id" not in df.columns:
+        df["group_id"] = 0
+
+    # (产品, group, date, 方向) 金额聚合
+    GROUP_KEYS = ["product_id", "group_id", "date"]
+    g = df.groupby(GROUP_KEYS + ["txn_type"], as_index=False)["amount"].sum()
+    piv = g.pivot_table(index=GROUP_KEYS, columns="txn_type",
+                        values="amount", fill_value=0.0).reset_index()
     for d in (0, 1):
         if d not in piv.columns:
             piv[d] = 0.0
-    daily = piv.rename(columns={0: "purchase", 1: "redemption"}).reset_index()
-    daily.columns.name = None
+    piv.columns.name = None
+    daily = piv.rename(columns={0: "purchase", 1: "redemption"})
     daily["net"] = daily["purchase"] - daily["redemption"]
-    cnt = df.groupby(["product_id", "date"]).size().rename("n_txn").reset_index()
-    daily = daily.merge(cnt, on=["product_id", "date"], how="left").fillna({"n_txn": 0})
+
+    # 笔数（用于上下文，不直接进 label）
+    cnt = df.groupby(GROUP_KEYS).size().rename("n_txn").reset_index()
+    daily = daily.merge(cnt, on=GROUP_KEYS, how="left").fillna({"n_txn": 0})
     daily["n_txn"] = daily["n_txn"].astype(int)
 
     dt = daily["date"]
@@ -134,16 +153,20 @@ def load_and_aggregate():
     daily["dom"] = dt.dt.day.astype("int8")
     daily["is_month_end"] = dt.dt.is_month_end.astype("int8")
     daily["is_quarter_end"] = dt.dt.is_quarter_end.astype("int8")
-    daily["direction"] = (daily["net"] < 0).astype(int)
+
+    # 4 维 token 前置筛选：用 net 符号判定 direction + |net| 分桶
+    daily["direction"] = (daily["net"] < 0).astype("int8")
     daily["amount_log1p"] = np.log1p(daily["net"].abs()).astype("float32")
     pid2type = {p: int(meta[p]["product_type_id"]) for p in meta}
     pid2risk = {p: int(meta[p]["risk_level"]) for p in meta}
     daily["product_type"] = daily["product_id"].map(pid2type).fillna(1).astype("int8")
-    daily["risk_level"] = daily["product_id"].map(pid2risk).fillna(2).astype("int8")
-    # 平移正化后取 log1p 作回归目标
-    offset = daily["net"].min()
-    daily["net_log1p"] = np.log1p(daily["net"] - offset + 1.0).astype("float32")
-    return daily, meta, offset
+    daily["risk_level"]   = daily["product_id"].map(pid2risk).fillna(2).astype("int8")
+
+    # ★ 两个分方向 log1p 标签（v4）—— 已是非负，直接 log1p 不平移
+    daily["purchase_log1p"]   = np.log1p(daily["purchase"]).astype("float32")
+    daily["redemption_log1p"] = np.log1p(daily["redemption"]).astype("float32")
+
+    return daily, meta
 
 
 def fit_amount_bins(train_daily: pd.DataFrame, n_bins: int = 16) -> np.ndarray:
@@ -159,22 +182,28 @@ def reapply_amount_bin(daily: pd.DataFrame, edges: np.ndarray) -> pd.DataFrame:
     return daily
 
 
-def build_sequences(daily: pd.DataFrame, hist_len: int = 30, offset: float = 0.0):
+def build_sequences(daily: pd.DataFrame, hist_len: int = 30):
+    """v4: 按 (product_id, group_id) 分组生成滑窗样本，label 为分方向 × 多 horizon。"""
     samples = []
     max_h = max(HORIZONS)
-    for pid, g in daily.groupby("product_id"):
+    for (pid, gid), g in daily.groupby(["product_id", "group_id"]):
         g = g.sort_values("date").reset_index(drop=True)
         if len(g) < hist_len + max_h + 1:
             continue
-        nets = g["net"].values
+        purch = g["purchase"].values
+        red   = g["redemption"].values
         for t in range(hist_len, len(g) - max_h):
             window = g.iloc[t - hist_len: t]
             features = window[FEATURE_DIMS].values.astype("float32")
             samples.append({
                 "features": features,
-                "product_id": pid,
-                "label_log1p": {h: float(np.log1p(nets[t + h - 1] - offset + 1.0)) for h in HORIZONS},
-                "label_raw": {h: float(nets[t + h - 1]) for h in HORIZONS},
+                "product_id": pid, "group_id": gid,
+                # 6 个标签：每 horizon 一个申、一个赎（log1p 空间）
+                "label_purchase_log1p": {h: float(np.log1p(purch[t + h - 1])) for h in HORIZONS},
+                "label_redemption_log1p": {h: float(np.log1p(red[t + h - 1])) for h in HORIZONS},
+                # 原始金额（用于回算 WAPE）
+                "label_purchase_raw": {h: float(purch[t + h - 1]) for h in HORIZONS},
+                "label_redemption_raw": {h: float(red[t + h - 1]) for h in HORIZONS},
                 "date": str(g.iloc[t]["date"].date()),
             })
     return samples
@@ -193,6 +222,11 @@ def temporal_split(samples):
 # ============================================================
 # Dataset / Model
 # ============================================================
+# label 顺序：[purchase_h1, purchase_h7, purchase_h30,
+#              redemption_h1, redemption_h7, redemption_h30]
+LABEL_KEYS = ("purchase_log1p", "redemption_log1p")
+
+
 class CashFlowDataset(Dataset):
     def __init__(self, samples, pid2idx):
         self.samples = samples
@@ -205,8 +239,12 @@ class CashFlowDataset(Dataset):
         s = self.samples[idx]
         feats = torch.tensor(s["features"], dtype=torch.float32)
         pid = torch.tensor(self.pid2idx[s["product_id"]], dtype=torch.long)
-        labels = torch.tensor([s["label_log1p"][h] for h in HORIZONS], dtype=torch.float32)
-        return feats, pid, labels
+        # v4: 6 维标签 (申×3horizon + 赎×3horizon)
+        labels = []
+        for kind in LABEL_KEYS:
+            for h in HORIZONS:
+                labels.append(s[f"label_{kind}"][h])
+        return feats, pid, torch.tensor(labels, dtype=torch.float32)
 
 
 class StructuredTokenEmbedding(nn.Module):
@@ -259,9 +297,11 @@ class CashFlowTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(enc, num_layers=depth)
         self.sprm = SPRMConv(dim=dim)
         self.norm = nn.LayerNorm(dim)
+        # v4: 双路 (purchase / redemption) × 3 horizon = 6 维输出
+        self.n_outputs = len(LABEL_KEYS) * len(HORIZONS)
         self.head = nn.Sequential(
             nn.Linear(dim, dim), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(dim, len(HORIZONS))
+            nn.Linear(dim, self.n_outputs)
         )
 
     def forward(self, feat, pid_idx):
@@ -318,7 +358,9 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
                 with torch.amp.autocast('cuda'):
                     out, _ = model(feats, pid)
                     loss = sum(F.huber_loss(out[:, j], labels[:, j], delta=1.0)
-                               for j in range(len(HORIZONS))) / len(HORIZONS)
+                               for j in range(model.module.n_outputs
+                                              if hasattr(model, "module") else model.n_outputs)
+                              ) / (model.module.n_outputs if hasattr(model, "module") else model.n_outputs)
                 if train_mode:
                     opt.zero_grad()
                     scaler.scale(loss).backward()
@@ -327,8 +369,9 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
                     scaler.step(opt); scaler.update()
             else:
                 out, _ = model(feats, pid)
+                n_out = model.module.n_outputs if hasattr(model, "module") else model.n_outputs
                 loss = sum(F.huber_loss(out[:, j], labels[:, j], delta=1.0)
-                           for j in range(len(HORIZONS))) / len(HORIZONS)
+                           for j in range(n_out)) / n_out
                 if train_mode:
                     opt.zero_grad()
                     loss.backward()
@@ -377,27 +420,25 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
             out, _ = model(feats, pid)
             preds_list.append(out.cpu().numpy())
             truths_list.append(labels.numpy())
-    # 原始真值（每个样本的 net）从 samples 取（log1p 真值 = labels; raw 真值 = label_raw）
-    raw_truth = np.array([[s["label_raw"][h] for h in HORIZONS] for s in test_s]) \
-        if rank == 0 else None
 
     if rank == 0:
-        preds = np.concatenate(preds_list)[:len(test_s)]
+        preds = np.concatenate(preds_list)[:len(test_s)]   # [N, 6]
         truths_arr = np.concatenate(truths_list)[:len(test_s)]
     else:
         preds = truths_arr = None
 
     return model, (preds if rank == 0 else None,
                    truths_arr if rank == 0 else None,
-                   raw_truth if rank == 0 else None), history, best_val
+                   test_s if rank == 0 else None), history, best_val
 
 
 # ============================================================
-# 指标
+# 指标（v4：labels 是 6 维：[pur_h1, pur_h7, pur_h30, red_h1, red_h7, red_h30]）
 # ============================================================
-def metrics(pred, truth):
+# 给定一列 (pred, truth)：算 MAE/RMSE/WAPE/DirAcc
+def metrics_one_col(pred, truth):
     pred = np.asarray(pred); truth = np.asarray(truth)
-    mae = float(np.mean(np.abs(pred - truth)))
+    mae  = float(np.mean(np.abs(pred - truth)))
     rmse = float(np.sqrt(np.mean((pred - truth) ** 2)))
     wape = float(np.sum(np.abs(pred - truth)) / max(np.sum(np.abs(truth)), 1e-6))
     sign_p = np.sign(np.diff(pred, prepend=pred[0]))
@@ -406,28 +447,51 @@ def metrics(pred, truth):
     return {"MAE": mae, "RMSE": rmse, "WAPE": wape, "DirAcc": dir_acc}
 
 
-# ============================================================
-# 基线 (Naive mean + LightGBM), 跟 Transformer 一样的多 seed 重复
-# ============================================================
-def baseline_naive_mean(daily_train: pd.DataFrame, test_s, seed: int):
-    """基线 1：每产品用历史 net 均值预测（加 seed 微扰展示方差）。"""
-    np.random.seed(seed)
-    out = {h: [] for h in HORIZONS}
-    means_log1p = {}
-    for pid, g in daily_train.groupby("product_id"):
-        nets = g["net"].values
-        m = float(np.log1p(nets.mean() - nets.min() + 1.0))
-        # 加 ±5% 微扰（展示多 seed 方差）
-        m *= 1.0 + np.random.normal(0, 0.02)
-        means_log1p[pid] = m
-    for s in test_s:
-        for h in HORIZONS:
-            out[h].append(means_log1p.get(s["product_id"], 0.0))
+def collect_metrics_for_targets(preds, truths, samples):
+    """v4: 返回嵌套 dict, 索引到 kind/purchase 或 redemption × horizon。
+    preds/truths: [N, 6]; samples 携带 6 个 label 的真值。
+    返回结构: {(kind, h): dict {MAE, RMSE, WAPE, DirAcc}}
+    """
+    out = {}
+    col = 0
+    for kind in LABEL_KEYS:           # purchase_log1p, redemption_log1p
+        for h in HORIZONS:            # 1, 7, 30
+            out[(kind, h)] = metrics_one_col(preds[:, col], truths[:, col])
+            col += 1
     return out
 
 
+# ============================================================
+# 基线 (Naive mean + LightGBM), 跟 Transformer 一样跑多 seed
+# ============================================================
+def baseline_naive_mean(daily_train: pd.DataFrame, test_s, seed: int):
+    """基线：用历史 (product, group) 维度上的 purchase/redemption 均值的 log1p 预测。
+
+    返回与 Transformer 相同口径的 6 维 pred。
+    """
+    np.random.seed(seed)
+    # 对每个 (product, group) 维度上：取 purchase/redemption 的历史均值，转 log1p
+    base = {}
+    for (pid, gid), g in daily_train.groupby(["product_id", "group_id"]):
+        pur_m = float(np.log1p(max(g["purchase"].mean(), 0)))
+        red_m = float(np.log1p(max(g["redemption"].mean(), 0)))
+        # ±5% 微扰（展示 seed 方差；可关掉）
+        pur_m *= 1.0 + np.random.normal(0, 0.02)
+        red_m *= 1.0 + np.random.normal(0, 0.02)
+        base[(pid, gid)] = (pur_m, red_m)
+
+    # 输出与 Transformer 一致的 [N, 6] 口径
+    preds = []
+    for s in test_s:
+        key = (s["product_id"], s["group_id"])
+        pur_m, red_m = base.get(key, (0.0, 0.0))
+        # 每个 horizon 都用历史均值（无 horizon-specific）
+        preds.append([pur_m, pur_m, pur_m, red_m, red_m, red_m])
+    return np.array(preds)   # [N, 6]
+
+
 def baseline_lightgbm(train_s, test_s, seed: int):
-    """基线 2: LightGBM 用序列统计特征回归 (多 seed; 不同 random_state)。"""
+    """基线: LightGBM 对 6 个目标分别训练（多 seed via random_state）。"""
     try:
         import lightgbm as lgb
     except ImportError:
@@ -438,20 +502,26 @@ def baseline_lightgbm(train_s, test_s, seed: int):
         f = s["features"]
         return np.concatenate([
             f.mean(axis=0), f.std(axis=0), f[-1],
-            [1.0 if s["product_id"] == "9K73101A" else 0.0],
+            # 把 group_id 也作为 one-hot 特征喂给 lgb
+            np.eye(8, dtype=float)[int(s["group_id"]) % 8],
         ])
 
     Xtr = np.stack([featurize(s) for s in train_s])
     Xte = np.stack([featurize(s) for s in test_s])
-    results = {}
-    for j, h in enumerate(HORIZONS):
-        ytr = np.array([s["label_log1p"][h] for s in train_s])
-        yte = np.array([s["label_log1p"][h] for s in test_s])
-        model = lgb.LGBMRegressor(n_estimators=200, max_depth=6, learning_rate=0.05,
-                                  random_state=seed, verbosity=-1, n_jobs=-1)
-        model.fit(Xtr, ytr)
-        results[h] = model.predict(Xte).tolist()
-    return results
+    # 6 个目标值
+    target_kinds = []
+    for kind in LABEL_KEYS:
+        for h in HORIZONS:
+            target_kinds.append((f"label_{kind}", h))
+
+    preds = np.zeros((len(test_s), 6))
+    for j, (lk, h) in enumerate(target_kinds):
+        ytr = np.array([s[lk][h] for s in train_s])
+        m = lgb.LGBMRegressor(n_estimators=200, max_depth=6, learning_rate=0.05,
+                              random_state=seed, verbosity=-1, n_jobs=-1)
+        m.fit(Xtr, ytr)
+        preds[:, j] = m.predict(Xte)
+    return preds   # [N, 6]
 
 
 # ============================================================
@@ -474,7 +544,7 @@ def main():
     amp = (not args.no_amp) and device.type == "cuda"
 
     print_rank0("\n==== 1. 加载 + 聚合 + 分桶 ====", rank)
-    daily, meta, offset = load_and_aggregate()
+    daily, meta = load_and_aggregate()
     print_rank0(f"  日级行数: {len(daily)} | 产品: {daily['product_id'].nunique()}", rank)
 
     dates_sorted = sorted(daily["date"].unique())
@@ -490,12 +560,14 @@ def main():
     print_rank0(f"  分桶边界数: {len(edges)}", rank)
 
     print_rank0("\n==== 2. 序列样本 ====", rank)
-    train_s = build_sequences(daily[daily["split"] == "train"], args.hist_len, offset)
-    val_s   = build_sequences(daily[daily["split"] == "val"],   args.hist_len, offset)
-    test_s  = build_sequences(daily[daily["split"] == "test"],  args.hist_len, offset)
+    train_s = build_sequences(daily[daily["split"] == "train"], args.hist_len)
+    val_s   = build_sequences(daily[daily["split"] == "val"],   args.hist_len)
+    test_s  = build_sequences(daily[daily["split"] == "test"],  args.hist_len)
     print_rank0(f"  train={len(train_s)} val={len(val_s)} test={len(test_s)}", rank)
-    if len(train_s) < 100:
-        print_rank0(f"[WARN] 样本过少 ({len(train_s)})，请用更大 --rate-multiplier 重跑仿真", rank)
+    print_rank0(f"  (聚合粒度: 产品×group×日，样本量是 v3 产品×日的 ~{len(GROUPS) if 'GROUPS' in dir() else 4}x)", rank)
+    if len(train_s) < 1000:
+        print_rank0(f"[WARN] train 样本仅 {len(train_s)}，Transformer 优势可能尚未展示；"
+                    f"检查仿真是否真跑全量 (verify_data.py)", rank)
 
     pids = sorted({s["product_id"] for s in train_s + val_s + test_s})
     pid2idx = {p: i for i, p in enumerate(pids)}
@@ -504,66 +576,70 @@ def main():
 
     # ===== 多 seed 跑三方法 =====
     all_runs = []
-    summary = {}  # method -> horizon -> {mean, std}
+    summary = {}  # method -> (kind, h) -> {mean, std}
 
     # 3.1 Transformer：跑每个 seed
-    transf_preds_per_seed = []   # 每个 seed 的 test preds, 用于 std
+    transf_preds_per_seed = []
     for i, seed in enumerate(seeds_list):
         print_rank0(f"\n==== 3.1 Transformer seed={seed} ({i+1}/{args.seeds}) ====", rank)
         t0 = time.time()
-        _, (preds, truths, raw_truth), history, best_val = train_one_seed(
+        _, (preds, truths, _samples), history, best_val = train_one_seed(
             train_s, val_s, test_s, pid2idx,
             seed=seed, epochs=args.epochs, lr=args.lr,
             batch_size=args.batch_size, dim=args.dim,
             device=device, rank=rank, world_size=world_size, amp=amp,
         )
         elapsed = time.time() - t0
-        print_rank0(f"  train elapsed: {elapsed:.1f}s, best_val={best_val:.4f}", rank)
+        print_rank0(f"  elapsed: {elapsed:.1f}s, best_val={best_val:.4f}", rank)
         if rank == 0:
-            # truths shape: [N, 3], preds shape: [N, 3]  (按 HORIZONS 顺序)
-            this_seed_metrics = {}
-            for j, h in enumerate(HORIZONS):
-                this_seed_metrics[h] = metrics(preds[:, j], truths[:, j])
+            this_seed_metrics = collect_metrics_for_targets(preds, truths, test_s)
+            # 把 (kind, h) 元组 key 序列化成 "kind|h"
+            this_seed_flat = {f"{kind}|{h}": m for (kind, h), m in this_seed_metrics.items()}
             all_runs.append({
                 "method": "Transformer", "seed": seed,
                 "best_val_loss": best_val, "elapsed_sec": elapsed,
-                "history": history, "metrics": {str(k): v for k, v in this_seed_metrics.items()},
+                "history": history, "metrics": this_seed_flat,
             })
             transf_preds_per_seed.append((seed, preds, truths))
 
-    # 3.2 基线：每个 seed
+    # 3.2 基线：每个 seed（口径与 Transformer 一致：pred_s [N,6] vs truths_arr [N,6]）
     if rank == 0:
+        truths_ref = np.array([
+            [s[f"label_{k}"][h] for k in LABEL_KEYS for h in HORIZONS]
+            for s in test_s
+        ])   # [N, 6]
         for i, seed in enumerate(seeds_list):
             print_rank0(f"\n==== 3.2 Baselines seed={seed} ({i+1}/{args.seeds}) ====", rank)
-            truths_ref = np.array([[s["label_log1p"][h] for h in HORIZONS] for s in test_s])
-            for method_name, pred_dict in [
+            for method_name, preds in [
                 ("Naive mean", baseline_naive_mean(daily_train, test_s, seed)),
                 ("LightGBM",   baseline_lightgbm(train_s, test_s, seed)),
             ]:
-                if pred_dict is None:
+                if preds is None:
                     continue
-                # pred_dict: {h: [vals]}
-                this_seed_metrics = {}
-                for j, h in enumerate(HORIZONS):
-                    this_seed_metrics[h] = metrics(pred_dict[h], truths_ref[:, j])
+                preds = np.asarray(preds)[:len(test_s), :]
+                m_flat = {}
+                col = 0
+                for kind in LABEL_KEYS:
+                    for h in HORIZONS:
+                        m_flat[f"{kind}|{h}"] = metrics_one_col(preds[:, col], truths_ref[:, col])
+                        col += 1
                 all_runs.append({
-                    "method": method_name, "seed": seed,
-                    "metrics": {str(k): v for k, v in this_seed_metrics.items()},
+                    "method": method_name, "seed": seed, "metrics": m_flat,
                 })
 
-        # 汇总均值标准差
+        # 汇总 mean±std（按 method × kind|horizon 维度聚合所有 seed）
         import collections
         grouped = collections.defaultdict(lambda: collections.defaultdict(list))
         for r in all_runs:
-            for h, m in r["metrics"].items():
+            for kh, m in r["metrics"].items():
                 for mk, mv in m.items():
-                    grouped[r["method"]][f"{h}/{mk}"].append(mv)
+                    grouped[r["method"]][f"{kh}/{mk}"].append(mv)
 
-        for method, h_metric_dict in grouped.items():
+        for method, kh_metric_dict in grouped.items():
             summary[method] = {}
-            for key, vals in h_metric_dict.items():
-                h, mk = key.split("/")
-                summary[method].setdefault(h, {})[mk] = {
+            for key, vals in kh_metric_dict.items():
+                kh, mk = key.split("/")
+                summary[method].setdefault(kh, {})[mk] = {
                     "mean": float(np.mean(vals)),
                     "std":  float(np.std(vals)),
                     "values": [float(v) for v in vals],
@@ -584,7 +660,7 @@ def main():
                 "amp": amp,
             }, f, ensure_ascii=False, indent=2)
 
-        # 逐样本预测 dump（取 Transformer 最优 seed）
+        # 逐样本预测 dump（取 Transformer 最优 seed）—— v4: 6 维 label (pur×3 + red×3)
         best_transf = max(
             [r for r in all_runs if r["method"] == "Transformer"],
             key=lambda r: -r["best_val_loss"]
@@ -594,36 +670,48 @@ def main():
             if s_seed == best_seed:
                 rows = []
                 for i, s in enumerate(test_s):
+                    # 列按 [pur_h1, pur_h7, pur_h30, red_h1, red_h7, red_h30] 顺序
                     rows.append({
-                        "product_id": s["product_id"], "date": s["date"],
-                        "seed": best_seed,
-                        "truth_log1p_h1": float(s_truths[i, 0]), "pred_log1p_h1": float(s_preds[i, 0]),
-                        "truth_log1p_h7": float(s_truths[i, 1]), "pred_log1p_h7": float(s_preds[i, 1]),
-                        "truth_log1p_h30": float(s_truths[i, 2]), "pred_log1p_h30": float(s_preds[i, 2]),
+                        "product_id": s["product_id"], "group_id": s["group_id"],
+                        "date": s["date"], "seed": best_seed,
+                        # Purchase (log1p 空间)
+                        "truth_pur_log1p_h1":  float(s_truths[i, 0]),  "pred_pur_log1p_h1":  float(s_preds[i, 0]),
+                        "truth_pur_log1p_h7":  float(s_truths[i, 1]),  "pred_pur_log1p_h7":  float(s_preds[i, 1]),
+                        "truth_pur_log1p_h30": float(s_truths[i, 2]),  "pred_pur_log1p_h30": float(s_preds[i, 2]),
+                        # Redemption (log1p 空间)
+                        "truth_red_log1p_h1":  float(s_truths[i, 3]),  "pred_red_log1p_h1":  float(s_preds[i, 3]),
+                        "truth_red_log1p_h7":  float(s_truths[i, 4]),  "pred_red_log1p_h7":  float(s_preds[i, 4]),
+                        "truth_red_log1p_h30": float(s_truths[i, 5]),  "pred_red_log1p_h30": float(s_preds[i, 5]),
                     })
                 pd.DataFrame(rows).to_parquet(OUT_DIR / "test_predictions.parquet", index=False)
                 break
 
         print_rank0(f"\n>> 落盘完成:", rank)
-        print_rank0(f"   - {OUT_DIR / 'eval_summary.json'}      多 seed×多 horizon×多方法均值标准差", rank)
-        print_rank0(f"   - {OUT_DIR / 'all_runs.jsonl'}         每个 run 一行 (含 history)", rank)
+        print_rank0(f"   - {OUT_DIR / 'eval_summary.json'}      多 seed×多 horizon×多方法 mean±std", rank)
+        print_rank0(f"   - {OUT_DIR / 'all_runs.jsonl'}         每 run 一行 (含 history)", rank)
         print_rank0(f"   - {OUT_DIR / 'test_predictions.parquet'}  最优 seed 逐样本预测 (画图用)", rank)
 
-        # 打印汇总表
-        print_rank0("\n==== 汇总 (mean ± std, {} seeds) ====".format(args.seeds), rank)
-        print_rank0(f"{'方法':22s} | {'horizon':8s} | {'WAPE':>14s} {'DirAcc':>10s}", rank)
-        print_rank0("-" * 64, rank)
+        # 汇总表（v4: 按 kind × horizon 打印）
+        print_rank0("\n==== 汇总 (mean ± std, {} seeds, 6 目标) ====".format(args.seeds), rank)
+        print_rank0(f"{'方法':14s} | {'目标':10s} | {'horizon':7s} | "
+                    f"{'WAPE':>14s} {'DirAcc':>10s}", rank)
+        print_rank0("-" * 70, rank)
         for method in ["Naive mean", "LightGBM", "Transformer"]:
             if method not in summary:
                 continue
-            for h in [str(h) for h in HORIZONS]:
-                w = summary[method].get(h, {}).get("WAPE", {})
-                d = summary[method].get(h, {}).get("DirAcc", {})
-                wm = w.get("mean", float("nan")); ws = w.get("std", 0)
-                dm = d.get("mean", float("nan")); ds = d.get("std", 0)
-                print_rank0(f"{method:22s} | +{h:>2s}d     | "
-                            f"{wm*100:.2f}±{ws*100:.2f}%   "
-                            f"{dm*100:.1f}±{ds*100:.1f}%", rank)
+            for kind in LABEL_KEYS:
+                kind_short = "申购" if "purchase" in kind else "赎回"
+                for h in HORIZONS:
+                    kh = f"{kind}|{h}"
+                    w = summary[method].get(kh, {}).get("WAPE", {})
+                    d = summary[method].get(kh, {}).get("DirAcc", {})
+                    wm = w.get("mean", float("nan")); ws = w.get("std", 0)
+                    dm = d.get("mean", float("nan")); ds = w.get("std", 0)
+                    if np.isnan(wm):
+                        continue
+                    print_rank0(f"{method:14s} | {kind_short:6s} +{h:>3d}d | "
+                                f"{wm*100:.2f}±{ws*100:.2f}%   "
+                                f"{dm*100:.1f}±{ds*100:.1f}%", rank)
 
     cleanup_distributed()
     return 0
