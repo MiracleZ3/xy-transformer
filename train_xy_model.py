@@ -107,7 +107,8 @@ def print_rank0(msg, rank=0):
 # 数据加载 / 聚合 / 序列化
 # ============================================================
 FEATURE_DIMS = ["direction", "amount_bin", "product_type", "risk_level",
-                "dow", "dom", "is_month_end", "is_quarter_end", "n_txn"]
+                "dow", "dom", "is_month_end", "is_quarter_end", "n_txn",
+                "yield_rate"]   # v5 新增：宏观收益率上下文（Transformer 应更会用）
 
 
 def load_and_aggregate():
@@ -147,6 +148,14 @@ def load_and_aggregate():
     cnt = df.groupby(GROUP_KEYS).size().rename("n_txn").reset_index()
     daily = daily.merge(cnt, on=GROUP_KEYS, how="left").fillna({"n_txn": 0})
     daily["n_txn"] = daily["n_txn"].astype(int)
+
+    # v5 新增：把 yield_rate 从 txns 逐笔→(product,group,date)聚合（取 mean；同一天内基本相同）
+    if "yield_rate" in df.columns:
+        yr = df.groupby(GROUP_KEYS)["yield_rate"].mean().reset_index()
+        daily = daily.merge(yr, on=GROUP_KEYS, how="left")
+        daily["yield_rate"] = daily["yield_rate"].fillna(0.02).astype("float32")
+    else:
+        daily["yield_rate"] = 0.02   # 旧数据无 yield_rate 时退化默认值
 
     dt = daily["date"]
     daily["dow"] = dt.dt.dayofweek.astype("int8")

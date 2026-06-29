@@ -7,20 +7,39 @@
 
 ---
 
-## v4 整改（**必须重跑**，v3 产物已失效）
+## v5 整改（**B 验证路径：注入复杂非线性规律 + 放大数据规模**）
+
+> v4 在 5643 样本上跑完，Transformer 5 seed 训练已触底（cv=0.73%）但仍显著输给 LightGBM
+> （6 目标输 5、赢 1；申购方向 −33%~−49%）。
+>
+> 诊断结论：v4 仿真规律太简单（只有 if-then 加成），LightGBM 这种决策树"原生"擅长；
+> Transformer 要发挥优势需要更复杂的非线性规律（长程趋势、跨特征相依）+ 更大数据规模。
+>
+> **v5 整改内容（已 push）**：
+> 1. **注入 3 种复杂非线性规律**（让 Transformer 应擅长）：
+>    - 宏观趋势水位（2 年期 sin 周期影响所有金额，需长序列建模）
+>    - 收益率拐点 → group-specific 赎回冲击（机构/HNW 敏感、零售钝化，非线性 cross-feature）
+>    - 新增 `yield_rate` 字段（Transformer 上下文 ψ）
+> 2. **数据规模放大 4×**：默认 `monthly_txn_rate` 12000 / 30000，目标 `n_train ≈ 20000`
+> 3. 训练器 FEATURE_DIMS 自动吸收 yield_rate
+>
+> **判据不预设结论**：v5 跑完按"误差棒不重叠才算显著优于"判；无论 Transformer 反超还是继续输，
+> 都据实写。
+
+## v4 整改（已落盘但 LightGBM 反超，**仅供回溯参考**）
 
 > 之前那次 A800 跑出来的 eval_summary.json 诊断出两个伪象：
 > 1. **log1p(net - offset + 1) 把目标压扁了 100 倍**（std/mean 从 3.27 → 0.03），1% WAPE 是假象
 > 2. **样本量太小**（n_train=1412）让 LightGBM 反超 Transformer，这是 2 产品×日级粒度的天然限制
 >
-> v4 修复（已 push）：
+> v4 修复：
 > - **新增 group 维度**：每个产品再细分为 4 个客户群（RETAIL_APP / RETAIL_OTC / HNW / INSTITUTIONAL），
->   仿真与训练都按 (产品 × group × 日) 聚合，**样本量从 ~1400 → ~8000**，让 Transformer 优势能显示
+>   仿真与训练都按 (产品 × group × 日) 聚合，**样本量从 ~1400 → ~5600**
 > - **label 改成 6 维**：`log1p(purchase)` + `log1p(redemption)` × 3 个 horizon。purchase/redemption
->   都是非负金额，直接 log1p 不做平移，没有压塌信号的伪象
-> - **基线对齐**：Naive mean / LightGBM 都跟 Transformer 用相同的 (产品×group×日) 口径
+>   都是非负金额，直接 log1p 不做平移
 >
-> **请重新跑一次 A800 流程，v3 的 eval_summary.json 不要再用。**
+> **但 v4 跑完后 LightGBM 仍 6 目标赢 5 个**，证明简单规律 + 中等样本量下 Tree 仍是更稳的选择。
+> v5 是基于 v4 的进一步验证，**请跑 v5，不要再跑 v4**。
 
 ## Step 0：环境准备（一次性）
 

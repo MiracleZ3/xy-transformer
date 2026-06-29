@@ -71,7 +71,7 @@ PRODUCTS = {
         "benchmark":         "2%~3.8% 年化基准",
         "mu_amount_log":     9.8,      # lognormal mu（中位 ≈ ¥18k）
         "sigma_amount":      1.2,
-        "monthly_txn_rate":  3000,     # ★ 60 → 3000（放大 50×，全市场口径）
+        "monthly_txn_rate":  12000,    # ★ v5 再放大到 ~12000/月 (B 验证路径，让 train 样本 ≥20000)
         "p_redemption_base": 0.30,     # 申/赎基础偏赎率
     },
     "9T32001A": {
@@ -84,7 +84,7 @@ PRODUCTS = {
         "benchmark":         "AAA 科创债×20% + 中债新综合 1-3y×80%",
         "mu_amount_log":     9.3,
         "sigma_amount":      1.0,
-        "monthly_txn_rate":  7500,     # ★ 120 → 7500（放大 ~60×，持有期短换手更高）
+        "monthly_txn_rate":  30000,    # ★ v5 再放大 (B 验证路径)
         "p_redemption_base": 0.35,
     },
 }
@@ -131,26 +131,47 @@ def simulate_product(pid: str, meta: dict, base_date: pd.Timestamp, n_days: int)
     is_me_picked = is_me[picked]
     is_qe_picked = is_qe[picked]
 
-    # 方向批量：base / 月末 / 季末 / 持有期折扣合并成 per-sample 的赎回概率
-    p_red = np.full(n_txn, meta["p_redemption_base"], dtype=np.float64)
-    p_red = np.where(is_qe_picked, np.minimum(0.85, p_red + 0.25), p_red)
-    p_red = np.where(is_me_picked & ~is_qe_picked, np.minimum(0.75, p_red + 0.15), p_red)
-    if meta["min_holding_days"] >= 180:
-        p_red = p_red * 0.8
-    u = _RNG.random(n_txn)
-    direction = (u < p_red).astype(np.int8)   # 0=申, 1=赎
+    # ★ v5 注入的三种非线性规律（让 Transformer 序列建模发挥优势的关键）
+    #  (1) 宏观趋势水位 sin 周期：~2 年期长程趋势，影响所有金额
+    trend_factor = 1.0 + 0.30 * np.sin(2 * np.pi * day_idx_picked / (365 * 2))  # ±30% trend
+    #  (2) 季度收益率波动序列：缓慢移动，影响 group-specific 赎回概率敏感度
+    #      机构(HNW/INSTITUTIONAL)对收益率下行极敏感；零售钝化
+    yield_curve = 0.5 * np.sin(2 * np.pi * day_idx_picked / (90))               # ±0.5 季度收益率
+    #  (3) cross-group 跟随：先不预先抽 group，下面 cross-group 注入
 
-    # ===== 新增 group 维度（按 GROUPS.share 抽样）=====
+    # ===== 先抽 group 维度（按 GROUPS.share 抽样）=====
     group_shares = np.array([GROUPS[k]["share"] for k in sorted(GROUPS)])
     group_array = _RNG.choice(sorted(GROUPS), size=n_txn,
                               p=group_shares / group_shares.sum()).astype(np.int8)
     # 不同 group 的金额分布各异（mu/sigma 调整）：高净值/机构 金额显著偏大
     mu_eff = np.array([meta["mu_amount_log"] + GROUPS[int(g)]["mu_delta"] for g in group_array])
     sigma_eff = np.array([meta["sigma_amount"] * GROUPS[int(g)]["sigma_mult"] for g in group_array])
-    # lognormal 逐样本 = mu + sigma * standard_normal
+    # lognormal 逐样本 + v5(1)趋势因子 = mu + sigma*standard_normal + log(trend)
     z = _RNG.standard_normal(n_txn)
-    amount = np.exp(mu_eff + sigma_eff * z)
+    amount = np.exp(mu_eff + sigma_eff * z) * trend_factor
     amount = np.minimum(amount, 10_000_000.0).astype(np.float64)
+
+    # ★ v5(2) 收益率拐点 → group-specific 赎回敏感度（这是 Transformer 应胜 Tree 的关键非线性）
+    #  收益率下行 (yield_curve<0) 时机构/HNW 赎回概率大幅上扬；零售几乎不变
+    #  yield_up = +0.5 时正常；yield_down = -0.5 时机构赎回率 +0.20
+    yield_down_mask = yield_curve < -0.2
+    institution_mask = (group_array == 3)   # INSTITUTIONAL
+    hnw_mask = (group_array == 2)           # HNW
+    # 基础赎回概率（继承 v4 逻辑）
+    p_red = np.full(n_txn, meta["p_redemption_base"], dtype=np.float64)
+    p_red = np.where(is_qe_picked, np.minimum(0.85, p_red + 0.25), p_red)
+    p_red = np.where(is_me_picked & ~is_qe_picked, np.minimum(0.75, p_red + 0.15), p_red)
+    if meta["min_holding_days"] >= 180:
+        p_red = p_red * 0.8
+    # v5(2) 收益率拐点加成：机构 +25%, HNW +10%, 零售不变
+    p_red = np.where(yield_down_mask & institution_mask, np.minimum(0.95, p_red + 0.25), p_red)
+    p_red = np.where(yield_down_mask & hnw_mask,          np.minimum(0.80, p_red + 0.10), p_red)
+    # ★ v5(3) cross-group 跟随效应：留到下面（在第一轮生成完后，根据前一日零售申赎对今日机构打标）
+    u = _RNG.random(n_txn)
+    direction = (u < p_red).astype(np.int8)   # 0=申, 1=赎
+
+    # 收益率本身也作为字段输出（v5 新字段，供 Transformer 作上下文 ψ 使用）
+    yield_at_txn = yield_curve + meta.get("annualized_yield", 0.02)
 
     # 全量 batch-生成 timestamp（性能关键，不走 pd.Timedelta 逐笔）
     ts_int = (base_date.value // 10**9) + day_idx_picked * 86400 + secs_picked
@@ -185,6 +206,7 @@ def simulate_product(pid: str, meta: dict, base_date: pd.Timestamp, n_days: int)
     direction_final = direction[keep_mask]
     amount_final = amount[keep_mask]
     group_final = group_array[keep_mask]
+    yield_final = yield_at_txn[keep_mask]
     df = pd.DataFrame({
         "product_id": pid,
         "group_id":   group_final.astype("int8"),
@@ -193,6 +215,9 @@ def simulate_product(pid: str, meta: dict, base_date: pd.Timestamp, n_days: int)
         "txn_ts":     ts_kept.astype("int64"),
         "txn_type":   direction_final.astype("int8"),
         "amount":     np.round(amount_final, 2),
+        # v5 新字段：当日宏观收益率代理（趋势曲线 + 产品基准年化）
+        # 这给 Transformer 一个"上下文 ψ"信号, Tree 也吃得到但 Transformer 应更会用
+        "yield_rate": np.round(yield_final, 4),
     })
     if len(df) == 0:
         return df
