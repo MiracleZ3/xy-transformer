@@ -11,7 +11,8 @@ train_xy_model.py
 
 建模（对齐 docs/01）:
   · PANTHER Eq.(4) 4 维结构化分词 (direction, amount_bin, product_type, risk_level)
-  · Transformer encoder + SPRM 多尺度空洞卷积 (论文 §3.3, dilation 1/2/4)
+  · Llama3 风格 decoder (RMSNorm + RoPE + SwiGLU + causal SDPA) + SPRM 多尺度空洞卷积
+    (论文 §3.3, dilation 1/2/4, 顶层并联)
   · 产品画像嵌入 (论文 §3.4 Profile-as-PosEnc)
   · 多窗口回归头 (1/7/30 天, Huber loss)
 
@@ -690,8 +691,9 @@ def run_pretraining(*, corpus_path, epochs, lr, batch_size, dim, device,
                     rank, world_size, amp, hist_len=30):
     """Stage-1 生成式预训练：在无标签语料上学 τ = (dir, amt_bin, type, risk) 的下一笔预测。
 
-    输出：model_out/pretrain.ckpt （只保存 backbone: token_emb/pos_emb/transformer/
-          sprm/norm/product_profile；regression head 与 pt_heads 都跟 backbone 一起存,
+    输出：model_out/pretrain.ckpt （只保存 backbone: token_emb / blocks.* (LlamaBlocks) /
+          sprm / norm / product_profile；RoPE 用 register_buffer(persistent=False) 不进 ckpt；
+          regression head 与 pt_heads 都跟 backbone 一起存,
           SFT 时只加载 backbone 部分, head 重新随机初始化）。
     """
     print_rank0(f"\n==== Stage-1 生成式预训练 ====", rank)

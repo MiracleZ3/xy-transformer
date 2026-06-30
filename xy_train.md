@@ -250,7 +250,7 @@ torchrun --nproc-per-node=3 --master-port=29500 train_xy_model.py \
 
 | 参数 | 推荐值 | 说明 |
 |---|---|---|
-| `--pretrain-ckpt` | 必填 | 加载 Stage-1 backbone (token_emb/pos_emb/transformer/sprm/norm/product_profile)；回归头与 pt_heads 都重新随机初始化 |
+| `--pretrain-ckpt` | 必填 | 加载 Stage-1 backbone (token_emb / blocks / sprm / norm / product_profile)；回归头与 pt_heads 都重新随机初始化 |
 | `--epochs 60` | 60 | 配合 early-stop (patience=15)，通常 25-40 epoch 收敛 |
 | `--seeds 5` | 5 | 每个 seed 重新加载同一份 ckpt，输出 mean±std |
 | `--batch-size 384` `--dim 256` | 与 Stage-1 一致 | |
