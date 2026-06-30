@@ -11,6 +11,11 @@ data_source/
 # === 数据工程中间产物（脚本可重新生成，不进仓） ===
 data_processed/
 
+# 预训练统一语料 (unify_corpus.py 产物，A800 上重新生成，不进仓)
+# 注意：data_sample 下 xy_txns.parquet / txns_real.parquet 等小样本已被历史 commit 进仓
+#       供 README 复现; 不要忽略它们 —— 否则 A800 上 git pull 会出现 "本地删除" 假象。
+data_sample/pretrain_corpus.parquet
+
 # === Python ===
 __pycache__/
 *.py[cod]

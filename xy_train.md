@@ -1,45 +1,23 @@
-# xy_train.md · A800 训练操作手册
+# xy_train.md · A800 训练操作手册（两段式：生成式预训练 → 回归 SFT）
 
-> 在 A800 服务器上从零跑完整流程、出最终图的精确步骤。每步含命令、预期输出、失败处理。
+> 在 A800 服务器上跑完 PANTHER 两段式训练、出最终图的精确步骤。每步含命令、预期输出、失败处理。
 >
-> **当前设备状态（用户反馈）**：8 卡 A800，但其中 5 卡被占用，**实际可用 3 卡**。
-> 因此下面 §2 的训练命令默认用 `--nproc-per-node=3`；如果未来卡释放，可改回 8。
+> **当前设备状态**：8 卡 A800，其中 5 卡被占用，**实际可用 3 卡**。下面训练命令默认 `--nproc-per-node=3`；
+> 卡释放后改 8 即可。
+>
+> **本手册当前路径**：先做 **Stage-1 生成式预训练**（在放大仿真 + akshare 真实基金语料上学"下一笔行为 token"），
+> 再做 **Stage-2 回归 SFT**（用预训练 ckpt 初始化 backbone，5 seed × LightGBM 基线对比 + 多窗口回归）。
+> 与 `docs/07-three-part-summary.md` 的当前结论 (LightGBM 6/6 WAPE 显著胜出，但 Transformer 方向命中率基本持平) 对齐；
+> 本轮目标是验证"加上 PANTHER Stage-1 预训练之后能否把误差棒收窄、方向命中率能否反超"。
+>
+> **模型架构（与 PANTHER 主体对齐，decoder-only）**：
+> - 自注意力恒走 causal mask（无开关，不是双向 encoder）
+> - SPRM 是 **causal** dilated conv（左 padding，只看历史），与 attention 并联、输出相加（论文 §3.3）
+> - 回归头与预训练头都从最后一位置 hidden `h[:, -1, :]` 出发（decoder-only 标准聚合）
+> - 因此 Stage-1 / Stage-2 用同一份 backbone 拓扑，**不存在"预训练是 decoder、SFT 是 encoder"的架构错配**——
+>   这是上一版（混合 encoder/decoder）的关键缺陷，本版已修正
 
 ---
-
-## v5 整改（**B 验证路径：注入复杂非线性规律 + 放大数据规模**）
-
-> v4 在 5643 样本上跑完，Transformer 5 seed 训练已触底（cv=0.73%）但仍显著输给 LightGBM
-> （6 目标输 5、赢 1；申购方向 −33%~−49%）。
->
-> 诊断结论：v4 仿真规律太简单（只有 if-then 加成），LightGBM 这种决策树"原生"擅长；
-> Transformer 要发挥优势需要更复杂的非线性规律（长程趋势、跨特征相依）+ 更大数据规模。
->
-> **v5 整改内容（已 push）**：
-> 1. **注入 3 种复杂非线性规律**（让 Transformer 应擅长）：
->    - 宏观趋势水位（2 年期 sin 周期影响所有金额，需长序列建模）
->    - 收益率拐点 → group-specific 赎回冲击（机构/HNW 敏感、零售钝化，非线性 cross-feature）
->    - 新增 `yield_rate` 字段（Transformer 上下文 ψ）
-> 2. **数据规模放大 4×**：默认 `monthly_txn_rate` 12000 / 30000，目标 `n_train ≈ 20000`
-> 3. 训练器 FEATURE_DIMS 自动吸收 yield_rate
->
-> **判据不预设结论**：v5 跑完按"误差棒不重叠才算显著优于"判；无论 Transformer 反超还是继续输，
-> 都据实写。
-
-## v4 整改（已落盘但 LightGBM 反超，**仅供回溯参考**）
-
-> 之前那次 A800 跑出来的 eval_summary.json 诊断出两个伪象：
-> 1. **log1p(net - offset + 1) 把目标压扁了 100 倍**（std/mean 从 3.27 → 0.03），1% WAPE 是假象
-> 2. **样本量太小**（n_train=1412）让 LightGBM 反超 Transformer，这是 2 产品×日级粒度的天然限制
->
-> v4 修复：
-> - **新增 group 维度**：每个产品再细分为 4 个客户群（RETAIL_APP / RETAIL_OTC / HNW / INSTITUTIONAL），
->   仿真与训练都按 (产品 × group × 日) 聚合，**样本量从 ~1400 → ~5600**
-> - **label 改成 6 维**：`log1p(purchase)` + `log1p(redemption)` × 3 个 horizon。purchase/redemption
->   都是非负金额，直接 log1p 不做平移
->
-> **但 v4 跑完后 LightGBM 仍 6 目标赢 5 个**，证明简单规律 + 中等样本量下 Tree 仍是更稳的选择。
-> v5 是基于 v4 的进一步验证，**请跑 v5，不要再跑 v4**。
 
 ## Step 0：环境准备（一次性）
 
@@ -52,260 +30,309 @@ nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv
 export CUDA_VISIBLE_DEVICES=0,1,2   # 改成你确认空闲的 3 张卡的 index
 
 # 0.3 装依赖
-pip install torch numpy pandas openpyxl lightgbm matplotlib
+pip install torch numpy pandas openpyxl lightgbm matplotlib akshare
 
-# 0.4 拉代码（务必 git pull 拿到 v4）
+# 0.4 拉代码
 git clone https://github.com/MiracleZ3/xy-transformer.git
 cd xy-transformer
 ```
 
 **关于 5 卡被占用的影响**：
 - A800 80GB 显存，本模型 `dim=256 batch=512` 单卡显存占用 ~5GB，**3 卡完全够用**
-- 训练时间会比 8 卡慢 ~2-3 倍，从 "15-30 分钟" 变成 "40-90 分钟"，可接受
-- 如果想再省时间，把 `--batch-size` 调大些（单卡 batch=128 → A800 80GB 还能吃下），
-  用 `--batch-size 384`（3 卡 × 128）就能接近 8 卡 × 64 的吞吐
+- 训练时间会比 8 卡慢 ~2-3 倍，可接受
+- 想再省时间把 `--batch-size` 调大些，A800 80GB 还能吃下
 
 ---
 
-## Step 1：生成全量仿真数据（百万级流水）
+## Step 1：生成预训练语料（两条线并行）
+
+PANTHER Stage-1 是**无监督**的，需要比 SFT 大得多的语料。本仓用 **放大仿真 + akshare 真实基金** 两条并行：
+
+### 1.1 放大仿真语料（主语料，~75 万笔）
 
 ```bash
-python3 simulate_xy_real_schema.py --years 3
+python3 simulate_xy_real_schema.py --rate-multiplier 50 --years 3
 ```
 
-**预期输出**（关键看这些数字）：
+把 `monthly_txn_rate` 整体 ×50（原本已经 12000/30000 → 60万/150万），3 年合计产出 ~75 万笔 xy schema 流水。
+落盘到 `data_sample/xy_txns.parquet`。
+
+**预期输出关键点**：
 ```
-  9K73101A: ~100,000~150,000 笔成功流水
-  9T32001A: ~300,000~400,000 笔成功流水
-===== 模拟数据自检（真实 schema）=====
-流水总笔数: 400,000 ~ 500,000       ← 必须几十万到百万量级，否则后续训练不稳
-产品数: 2
-申/赎占比: 申 65% / 赎 35%
-9K73101A: 赎占比 ~27%（长持有期）
-9T32001A: 赎占比 ~39%（短持有期）
+流水总笔数: ~750,000（必须到几十万级，否则后续预训练语料不够）
+申/赎占比: 申 ~65% / 赎 ~35%
 ```
 
-**搭建跑完用 `verify_data.py` 做 sanity check（v4 会校验 group 维度）**：
+### 1.2 akshare 真实基金语料（领域对齐微语料，~38k 笔）
+
+```bash
+python3 fetch_fund_flow.py --n-etfs 60 --years 3
+```
+
+从 akshare 拉取成交额排名前 60 的 ETF 日 K，3 年回看，产出 ~38k 行真实市场资金流（落 `data_sample/txns_real.parquet`）。
+
+**注意**：
+- 这是**真实市场数据**，给预训练模型"固收产品的资金流动力学"先验，但与 xy 的真实客户层申赎**分布不完全一致**
+- akshare 拉取耗时 ~10-15 分钟（限频 + 60 次 HTTP），建议 `nohup ... &` 后台跑
+- 如果网络不通或被 ban：本语料**可以跳过**，只靠放大仿真也能完成 Stage-1（详见 §1.4）
+
+### 1.3 合并两类语料成预训练统一 schema
+
+```bash
+python3 unify_corpus.py
+```
+
+把两类语料 coax 进同一个 4 维 token schema（`direction / amount_bin / product_type / risk_level`），
+统一 16 桶 quantile 分桶（按 direction 分别 fit），落 `data_sample/pretrain_corpus.parquet`。
+
+**预期输出关键点**：
+```
+[load] 仿真语料 ... → ~750,000 行
+[load] akshare 语料 ... → ~38,000 行
+总行数: ~790,000
+direction: 申 ~65% / 赎 ~35%
+amount_bin 分布 (均匀为佳): {0: ..., 1: ..., ..., 15: ...}    ← 各桶笔数接近
+product_type 分布: {1: 大头(固收), 2: 中等(ETF 股基), ...}
+risk_level 分布:   {2: 大头(xy R2), 5: 中等(ETF R5), ...}
+```
+
+只要 `amount_bin` 各桶大致均匀（不集中在某一个桶），就说明分桶成功。
+
+### 1.4 数据完整性校验
 
 ```bash
 python3 verify_data.py
 ```
 
-**预期输出关键判断点**（v4）：
-```
-== group 维度 ==
-group 数: 4
-  group=0 (RETAIL_APP): 笔数=... 中位=¥8-15k       ← 零售
-  group=1 (RETAIL_OTC): 笔数=... 中位=¥6-12k
-  group=2 (HNW): 笔数=... 中位=¥30-50k              ← 高净值
-  group=3 (INSTITUTIONAL): ... 中位=¥100-300k       ← 机构，金额明显偏大
-...
-✓ 赎占比: 9K73101A=27.x% < 9T32001A=39.x% (持有期差异保留)
-```
-只要**4 个 group 的中位金额呈递增**（零售 < 高净值 < 机构）就说明 group 仿真合理。
+校 `xy_txns.parquet` 的 4 个 group 维度（RETAIL_APP/RETAIL_OTC/HNW/INSTITUTIONAL）+ 收益率字段。
+只要**4 个 group 的中位金额呈递增**（零售 < 高净值 < 机构）就说明仿真合理。
 
-**失败处理**：
-- 行数 < 10 万 → 检查 `simulate_xy_real_schema.py` 里 `PRODUCTS` 的 `monthly_txn_rate` 是否被改成小值（应该 3000/7500）
-- 内存不够 → 用 `--rate-multiplier 0.5` 减半
-- 想要更长时间窗 → `--years 5`
+### 1.5 防数据泄漏（关键合规说明）
+
+PANTHER 两段式天然的隔离机制，本流程严格执行：
+
+| 阶段 | 数据 | 信号 |
+|---|---|---|
+| **Stage-1 预训练** | `pretrain_corpus.parquet`（75万仿真+38k ETF） | **只吃 4 维 token**（方向/金额桶/产品类型/风险等级），**不接触任何金额回归标签** |
+| **Stage-2 SFT** | `xy_txns.parquet` 的时间切分 70/15/15（同 SFT 流程），n_train≈5-20k | 6 维 `log1p(purchase)/log1p(redemption)` × 3 horizon |
+
+预训练语料和 SFT 数据**在产品 ID 上可能重叠**（仿真语料用了相同的 9K.../9T... 产品），但这不是泄漏：
+PANTHER 的设计前提就是 "无监督学行为表示 → 监督任务上微调"，监督信号只来自 Stage-2。预训练阶段**永远不会看到 SFT 标签**。
 
 ---
 
-## Step 2：A800 全量训练（核心步骤）
+## Step 2：Stage-1 生成式预训练（A800 核心）
 
 ### 2.1 标准命令（3 卡可用版）
 
 ```bash
 torchrun --nproc-per-node=3 --master-port=29500 train_xy_model.py \
+    --pretrain \
+    --pretrain-data data_sample/pretrain_corpus.parquet \
+    --pretrain-epochs 30 \
+    --dim 256 \
+    --batch-size 384
+```
+
+| 参数 | 推荐值 | 说明 |
+|---|---|---|
+| `--pretrain` | (flag) | 触发 Stage-1 短路：跑预训练然后退出，不进 SFT 评估流程 |
+| `--pretrain-data` | 默认值即可 | 上一 step 产出的统一语料 |
+| `--pretrain-epochs 30` | 20–40 | causal LM 在 75万+38k 语料上通常 20–30 内收敛 |
+| `--dim 256` | 256 | 与 Stage-2 SFT **必须一致**，否则 backbone 权重形状不匹配 |
+| `--batch-size 384` | 3 卡 × 128 | 8 卡可用 512 |
+| `--no-amp` | 默认开 AMP | 出 NaN 才关 |
+
+> **必须与 SFT 共用 `--dim`**——预训练 ckpt 是按 dim 形状存的，加载时会校验形状，dim 不一致会跳过加载 backbone。
+
+### 2.2 训练过程中应该看到的日志
+
+```
+==== Stage-1 生成式预训练 ====
+  语料: .../pretrain_corpus.parquet
+  预训练样本数: ~790,000 / hist_len=30
+  [pretrain] epoch   1/30  loss=3.51  best=3.51
+  [pretrain] epoch   5/30  loss=2.83  best=2.83
+  [pretrain] epoch  15/30  loss=2.41  best=2.41
+  [pretrain] epoch  25/30  loss=2.27  best=2.27
+  [pretrain] epoch  30/30  loss=2.24  best=2.24
+  >> 预训练 ckpt 落: model_out/pretrain.ckpt (best_loss=2.24)
+```
+
+### 2.3 判读预训练是否正常
+
+| 现象 | 解读 / 处理 |
+|---|---|
+| loss 从 3.5 单调下降到 ~2.2–2.5 | ✅ 正常收敛 |
+| loss 停在 3.5 不动 | 语料突然 collapse：检查 unify_corpus.py 输出某桶是否占 100% |
+| loss 降到 ~3.0 以下 | 方向/金额桶预测能学了，迁移到 SFT 通常有效果 |
+| 30 epoch 没触底 | `--pretrain-epochs 50` 重跑 |
+| `dim mismatch` 报错 | SFT 用了不同的 `--dim`，重训 SFT 时保持一致 |
+
+**预训练目标的下界参考**：4 路 cross-entropy 求和；理论随机基线 = `log(2)+log(16)+log(6)+log(6) ≈ 5.40`。
+收敛到 ~2.2 表示"比随机猜下一笔显著好"；稳态 loss 越低通常 SFT 收益越大，但不绝对（预训练 ≠ 下游 task gain）。
+
+### 2.4 失败处理
+
+| 报错 | 解决 |
+|---|---|
+| `CUDA out of memory` | `--batch-size` 减半 |
+| `预训练语料为空` | Step 1 没产出 `pretrain_corpus.parquet`，重新跑 unify_corpus.py |
+| `MMCV / NCCL timeout` | 换 `--master-port 29501` |
+
+---
+
+## Step 3：Stage-2 回归 SFT（A800 核心）
+
+### 3.1 标准命令（用预训练 ckpt 初始化）
+
+```bash
+torchrun --nproc-per-node=3 --master-port=29500 train_xy_model.py \
+    --pretrain-ckpt model_out/pretrain.ckpt \
     --epochs 60 \
     --seeds 5 \
     --batch-size 384 \
     --dim 256
 ```
 
+> 与原"从零训练"的唯一区别就是加 `--pretrain-ckpt`。其余照旧：5 seed × LightGBM × Naive mean + 6 目标评估。
+
 | 参数 | 推荐值 | 说明 |
 |---|---|---|
-| `--nproc-per-node` | **3**（当前实际可用卡数）| 8 卡全空时可改 8 |
+| `--pretrain-ckpt` | 必填 | 加载 Stage-1 backbone (token_emb/pos_emb/transformer/sprm/norm/product_profile)；回归头与 pt_heads 都重新随机初始化 |
 | `--epochs 60` | 60 | 配合 early-stop (patience=15)，通常 25-40 epoch 收敛 |
-| `--seeds 5` | 5 | 每个 seed 跑一遍，输出 mean±std |
-| `--batch-size 384` | 3 卡 × 128 | 8 卡时可用 512 (8×64) |
-| `--dim 256` | 256 | Transformer 隐维；不够就调 384/512 |
+| `--seeds 5` | 5 | 每个 seed 重新加载同一份 ckpt，输出 mean±std |
+| `--batch-size 384` `--dim 256` | 与 Stage-1 一致 | |
 
 **预期耗时**：40-90 分钟（3 卡 + 5 seeds + 60 epochs 上限）
 
-### 2.2 如果 5 卡被释放后想用满 8 卡
-
-把 `--nproc-per-node 3` 改成 `--nproc-per-node 8`，`--batch-size 384` 改 `--batch-size 512`，
-取消 `CUDA_VISIBLE_DEVICES`，时间能压回 15-30 分钟。
-
-### 2.3 训练过程中应该看到的日志
+### 3.2 训练过程中应该看到的日志
 
 ```
+==== SFT 模式：加载预训练 backbone model_out/pretrain.ckpt ====
+  [pretrain-ckpt] ...: 加载 62/62 个 backbone 参数, 0 个预训练里有但当前模型没有,
+                        0 个 backbone 参数仍是随机初始化 (...)
+==== 1. 加载 + 聚合 + 分桶 ====
+  日级行数: ~31,800 | 产品: 2
+==== 2. 序列样本 ====
+  train=~5,650 val=~832 test=~840
 ==== 3.1 Transformer seed=xxx (1/5) ====
-  [seed=xxx] epoch   1/60  train=0.7123  val=0.2105  best=0.2105  no_improve=0/15
-  [seed=xxx] epoch  10/60  train=0.2455  val=0.0917  best=0.0884  no_improve=2/15
-  [seed=xxx] epoch  20/60  train=0.2123  val=0.0895  best=0.0821  no_improve=0/15
-  [seed=xxx] epoch  33/60  ...
-  [seed=xxx] early-stop at epoch 33                    ← val 连续 15 epoch 没改善触发
-  train elapsed: 480s, best_val=0.0821
-==== 3.2 Baselines seed=xxx (1/5) ====
-...
+  [seed=xxx] epoch  1/60  train=0.41  val=0.10  best=0.10  no_improve=0/15
+  ...
 ==== 汇总 (mean ± std, 5 seeds) ====
-方法              | horizon |     WAPE        DirAcc
-------------------------------------------------------------
-Naive mean        | + 1d    | X.XX±0.XX%   X.X±0.X%
-Naive mean        | + 7d    | ...
-Naive mean        | +30d    | ...
-LightGBM          | + 1d    | ...
-LightGBM          | + 7d    | ...
-LightGBM          | +30d    | ...
-Transformer       | + 1d    | X.XX±0.XX%   X.X±0.X%
-Transformer       | + 7d    | ...
-Transformer       | +30d    | ...
+...
 ```
 
-### 2.4 判读训练是否正常
+ckpt-load 日志那一行**必须显示 `加载 62/62 个 backbone 参数`**，否则权重没迁上。
 
-| 现象 | 解读 / 处理 |
+### 3.3 判读 SFT 是否有效
+
+参考 `docs/07-three-part-summary.md §3.3 / §3.4` 的判据：
+
+| 现象 | 解读 |
 |---|---|
-| val 单调下降至 0.05~0.10，early-stop 触发 | ✅ 正常收敛 |
-| val 在 epoch 10 后仍大幅震荡 | 调 `--lr 1e-4` 重跑 |
-| 跑到 60 epoch 仍在下降 | `--epochs 100` 重跑 |
-| Transformer 的 WAPE 远高于 Naive mean（>2x） | ⚠ 模型没学到东西，先回 Step 1 看 `verify_data.py` 输出 |
-| 三方法误差棒重叠（std > mean × 10%） | 诚实结论「差异不显著」，不要强行粉饰 |
-| 三方法误差棒不重叠 & Transformer 完胜 | ✅ 可作「显著优于」结论 |
+| Transformer 6/6 目标 WAPE **误差棒与 LightGBM 接近重叠** | ✅ 预训练把差距收窄；可写入"两种方法在该规模下能力接近"的结论 |
+| 任一目标 WAPE **误差棒完全不重叠且 Transformer 更优** | ✅ 显著优于；写正向结论 |
+| 所有目标仍 LightGBM 显著优于 Transformer、方向命中率无变化 | ⚠ 预训练在这个规模/规律下收益不足；承认当前设置仍对 Tree 最有利 |
+| 6 目标方向命中率 Transformer 全部接近或反超 LightGBM | "方向信号上学到了真实信息"——即使幅值输掉，方向判断上的价值已有 |
 
-### 2.5 最终产物（训练完后 `model_out/` 下）
+**不预设结论**：误差棒判据是客观的（Transformer.mean + std < LightGBM.mean - std 才算显著优于），据实写。
 
-| 文件 | 用途 |
-|---|---|
-| `eval_summary.json` | 多 seed × 多 horizon × 多方法的 mean±std（**填结论表的核心**）|
-| `all_runs.jsonl` | 每个 run 一行（含完整 history，画训练曲线用） |
-| `test_predictions.parquet` | 最优 seed 的逐样本预测（画散点用） |
-
-### 2.6 失败处理
+### 3.4 失败处理
 
 | 报错 | 解决 |
 |---|---|
-| `CUDA out of memory` | `--batch-size` 减半（384→192）|
-| `NCCL timeout` / `connection refused` | 换 `--master-port 29501`，或检查防火墙 |
-| 只有 1 张卡在跑 | 没用 `torchrun` 改用 `python3`；或者忘了 `export CUDA_VISIBLE_DEVICES` |
-| 5 seeds 跑太慢想先看趋势 | `--seeds 3`，确认无误再补到 5 |
-| 服务器掉 SSH 进程被打断 | 用 `nohup ... &` 后台跑，日志写文件 |
+| `dim mismatch` 加载跳过 | Stage-1/Stage-2 用了不同 `--dim`，重训保证一致 |
+| `加载 0/62 个 backbone 参数` | ckpt 路径错或被覆写；重训 Stage-1 |
+| val loss 比从零训练还差 | 预训练语料 collapse；回 Step 1 看 unify 输出 |
+| 5 seeds 太慢 | `--seeds 3` 先跑通 |
 
 ---
 
-## Step 3：出 4 张图
+## Step 4：出图
 
 ```bash
 python3 plot_summary.py
 ```
 
-**预期输出**：
-```
-生成插图...
-✓ fig1_data_distribution.png
-✓ fig2_time_patterns.png
-✓ fig3_training_curve.png
-✓ fig4_eval_comparison.png
-```
+**4 张图**（fig1/2 用 data_sample/xy_txns.parquet，fig3/4/5 用 model_out 的 SFT 产物）：
+- fig3 训练曲线
+- fig4 三方法 WAPE 对比 + 误差棒
+- fig5 散点（最优 seed 逐样本预测 vs 真值）
 
-**关键看 fig4**（基线对比主图）：
-- 图上**不应再有红字"训练未收敛"警告**（脚本自动检测收敛，正常会消失）
-- **图4a**：WAPE 误差棒清楚显示 Transformer 是否显著低于 LightGBM
-- **图4b**：相对提升 % 三柱为正数，数字越大越好
-- **图4c**：散点紧贴红色 y=x 对角线，两种产品颜色不混
-
-如果图上还显示"训练未收敛"红字，回 Step 2 调参重跑。
+**关键看 fig4**：误差棒是否**变窄了**（比 docs/07 §3.3 旧结果），以及 Transformer 是否与 LightGBM 误差棒更接近重叠。
 
 ---
 
-## Step 4：把产物拷回本地
+## Step 5：把产物拷回本地
 
-在本地终端（非服务器）执行：
+在本地终端（非服务器）：
 
 ```bash
-# 优先：把 "可作为结论的产物" 都拷回
+# 必拷（含预训练 ckpt 用于复现 SFT）
 scp user@a800-server:/path/to/xy-transformer/model_out/eval_summary.json ./model_out/
 scp user@a800-server:/path/to/xy-transformer/model_out/test_predictions.parquet ./model_out/
 scp user@a800-server:/path/to/xy-transformer/model_out/all_runs.jsonl ./model_out/
+scp user@a800-server:/path/to/xy-transformer/model_out/pretrain.ckpt ./model_out/
 scp user@a800-server:/path/to/xy-transformer/docs/assets/*.png ./docs/assets/
-
-# 或用 rsync 一次性同步
-rsync -av user@a800-server:/path/to/xy-transformer/model_out/ ./model_out/
-rsync -av user@a800-server:/path/to/xy-transformer/docs/assets/ ./docs/assets/
 ```
-
-**必拷**：
-- `docs/assets/*.png`（4 张图）← 给文档
-- `model_out/eval_summary.json` ← 填结论表用
-
-**可选拷**：
-- `model_out/all_runs.jsonl`（debug / 看每 seed 曲线）
 
 ---
 
-## Step 5：填结论表（拷回本地后）
+## Step 6：填结论表（拷回本地后）
 
-打开 `model_out/eval_summary.json`，结构长这样：
-```json
-{
-  "summary": {
-    "Naive mean":   {"1": {"WAPE": {"mean": 0.067, "std": 0.002}, "DirAcc": {...}}, ...},
-    "LightGBM":     {"1": {"WAPE": {"mean": 0.058, "std": 0.001}, ...}, ...},
-    "Transformer":  {"1": {"WAPE": {"mean": 0.052, "std": 0.003}, ...}, ...}
-  },
-  ...
-}
-```
+打开 `model_out/eval_summary.json`，**先看是否含 `is_sft_mode: true`**（确认本轮是 SFT 模式而非误跑从零训练）。
+然后按 `docs/07-three-part-summary.md §3.3` 模板表填 6 目标 × 3 方法的 mean±std。
 
-按 `docs/07-three-part-summary.md §3.3` 模板表填入每格，写 `mean±std%`。
-
-**判据**（docs/07 §3.3 规定的）：
+**判据**（docs/07 §3.4）：
 - 误差棒**不重叠**（`Transformer.mean + std < LightGBM.mean - std`）才算「显著优于」
-- 仅均值更低但误差棒重叠 → 结论必须改为「在 N seed 范围内 Transformer 不劣于 LightGBM」
+- 仅均值更低但误差棒重叠 → 必须改为「在 N seed 范围内 Transformer 不劣于 LightGBM」
 
 ---
 
 ## 一行流水线（按需复制）
 
 ```bash
-# 3 卡版（当前设备状态）
+# 完整两段式（3 卡）
 git clone https://github.com/MiracleZ3/xy-transformer.git && cd xy-transformer && \
-pip install torch numpy pandas openpyxl lightgbm matplotlib && \
+pip install torch numpy pandas openpyxl lightgbm matplotlib akshare && \
 export CUDA_VISIBLE_DEVICES=0,1,2 && \
-python3 simulate_xy_real_schema.py --years 3 && \
+# Stage-1 语料
+python3 simulate_xy_real_schema.py --rate-multiplier 50 --years 3 && \
+python3 fetch_fund_flow.py --n-etfs 60 --years 3 && \
+python3 unify_corpus.py && \
 python3 verify_data.py && \
+# Stage-1 预训练
 torchrun --nproc-per-node=3 --master-port=29500 train_xy_model.py \
+    --pretrain --pretrain-data data_sample/pretrain_corpus.parquet \
+    --pretrain-epochs 30 --dim 256 --batch-size 384 && \
+# Stage-2 SFT
+torchrun --nproc-per-node=3 --master-port=29500 train_xy_model.py \
+    --pretrain-ckpt model_out/pretrain.ckpt \
     --epochs 60 --seeds 5 --batch-size 384 --dim 256 && \
 python3 plot_summary.py
 ```
 
-总耗时约 40-90 分钟。
+总耗时 ~90 分钟（语料生成 ~15 分钟 + 预训练 ~30 分钟 + SFT ~40 分钟 + 出图 ~1 分钟）。
 
 ---
 
-## 关于 pandas FutureWarning（已修）
+## 关于 pandas FutureWarning（已规避）
 
-之前在 shell 里 ad-hoc 跑的：
-```python
-df.groupby('product_id').apply(lambda g: (g.txn_type==1).mean())  # ⚠ 触发 FutureWarning
-```
-在 pandas 3.x 会变成 error。仓库脚本**没用**这种写法，全部用 `groupby[...].mean()`
-向量化聚合。如果需要快速核对数据，**用 `verify_data.py`**，它已经显式用
-`include_groups=False` 处理掉了这个 warning，未来 pandas 升级兼容。
+仓库脚本全部用 `groupby[...].mean()` 向量化聚合，不触发 pandas 3.x 的 `groupby.apply` FutureWarning。
+如需快速核对数据，用 `verify_data.py`（已显式 `include_groups=False`）。
 
 ---
 
 ## 完成后发我两份
 
-1. `docs/assets/*.png`（4 张图）
-2. `model_out/eval_summary.json`（数字结果）
+1. `docs/assets/*.png`（4 张图，含 fig4 误差棒对比）
+2. `model_out/eval_summary.json`（数字结果，**需含 `is_sft_mode: true`**）
 
 我据此：
-- 检查 fig4 是否还有"未收敛"警告（没有才作数）
-- 按 §3.3「误差棒不重叠才算显著优于」的判据据实填表
-- 如果 Transformer 显著优于基线，写正向结论
-- **如果基线反序或差异不显著，按 docs/07 §3.5 的保守版结论写，不强行粉饰**
+- 检查 fig4 是否有"未收敛"警告（没有才作数）
+- 按 §3.4「误差棒不重叠才算显著优于」的判据据实填 §3.3 表
+- 与 docs/07 当前结论（without pretrain）做 A/B 对比，看预训练带来的 delta
+- **如果基线反序或差异不显著，按 docs/07 §3.5 保守版结论写，不强行粉饰**
 
 报错或异常贴 stderr 给我。

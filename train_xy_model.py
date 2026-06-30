@@ -234,6 +234,8 @@ def temporal_split(samples):
 # label 顺序：[purchase_h1, purchase_h7, purchase_h30,
 #              redemption_h1, redemption_h7, redemption_h30]
 LABEL_KEYS = ("purchase_log1p", "redemption_log1p")
+AMOUNT_BINS = 16   # PANTHER Eq.(4) 第 2 维，对齐 fit_amount_bins(n_bins=16)
+PRETRAIN_CORPUS = HERE / "data_sample" / "pretrain_corpus.parquet"
 
 
 class CashFlowDataset(Dataset):
@@ -248,12 +250,59 @@ class CashFlowDataset(Dataset):
         s = self.samples[idx]
         feats = torch.tensor(s["features"], dtype=torch.float32)
         pid = torch.tensor(self.pid2idx[s["product_id"]], dtype=torch.long)
-        # v4: 6 维标签 (申×3horizon + 赎×3horizon)
+        # 6 维标签 (申×3horizon + 赎×3horizon)
         labels = []
         for kind in LABEL_KEYS:
             for h in HORIZONS:
                 labels.append(s[f"label_{kind}"][h])
         return feats, pid, torch.tensor(labels, dtype=torch.float32)
+
+
+class PretrainDataset(Dataset):
+    """无监督语料：返回 (特征序列, product_id) 仅给预训练头用。
+
+    特征序列的 4 维 (direction, amount_bin, product_type, risk_level) 既是输入
+    又是预测目标 (做 t → t+1 的 shift)。预训练只消费这 4 维 token，**不接触回归
+    标签 (purchase/redemption 金额)**，因此不与 SFT train/val/test 共享监督信号。
+    """
+    def __init__(self, parquet_path, hist_len=30):
+        df = pd.read_parquet(parquet_path)
+        # 派生 dow/dom 等上下文 (只给 SPRM 卷积, 不进 token)
+        if "dow" not in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            df["dow"] = df["date"].dt.dayofweek.astype("float32")
+            df["dom"] = df["date"].dt.day.astype("float32")
+            df["is_month_end"] = df["date"].dt.is_month_end.astype("float32")
+            df["is_quarter_end"] = df["date"].dt.is_quarter_end.astype("float32")
+
+        self.hist_len = hist_len
+        self.columns = ["direction", "amount_bin", "product_type",
+                        "risk_level", "dow", "dom", "is_month_end",
+                        "is_quarter_end"]
+        # 缺列补 0，保证特征维数与 SFT 路径一致 (10 维)
+        for c in self.columns + ["n_txn", "yield_rate"]:
+            if c not in df.columns:
+                df[c] = 0.0
+
+        # 按 product_id (跨 group) 打成长序列 —— PANTHER 的行为序列打包
+        self.sequences = []
+        self.pids = []
+        for pid, g in df.sort_values(["product_id", "date"]).groupby("product_id", sort=False):
+            feats = g[self.columns + ["n_txn", "yield_rate"]].values.astype("float32")
+            if len(feats) < hist_len + 1:
+                continue
+            # 滑窗切片，每个窗口 hist_len 长度
+            for t in range(0, len(feats) - hist_len):
+                self.sequences.append(feats[t:t + hist_len])
+                self.pids.append(pid)
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        feats = torch.tensor(self.sequences[idx], dtype=torch.float32)
+        pid = self.pids[idx]
+        return feats, pid
 
 
 class StructuredTokenEmbedding(nn.Module):
@@ -272,29 +321,50 @@ class StructuredTokenEmbedding(nn.Module):
 
 
 class SPRMConv(nn.Module):
+    """Causal (decoder-only) multi-scale dilated depthwise conv.
+
+    与 PANTHER §3.3 对齐：多尺度 dilation 的 depthwise conv 与 self-attention 并联、
+    输出加到 attention 输出上。但 PANTHER 论文里 SPRM 是作为 decoder 的组成部分，因此
+    卷积必须 **causal** (只左看 right padding=0) —— 否则位置 t 的感受野会含 t+1 等未来 token,
+    破坏 next-token 预测的泄漏约束. 这里用左侧 padding=(kernel-1)*dilation、右侧裁掉实现.
+    """
     def __init__(self, dim, kernel=3, dilations=(1, 2, 4)):
         super().__init__()
-        # 用 padding 保证输出长度与输入一致
+        self.kernel = kernel
+        self.dilations = dilations
         self.convs = nn.ModuleList([
             nn.Conv1d(dim, dim, kernel_size=kernel, dilation=d,
-                      padding=d * (kernel - 1))
+                      padding=0)   # 显式 0 padding, 手工做左侧零填充
             for d in dilations
         ])
 
     def forward(self, x):  # x: [B, T, D]
         xt = x.transpose(1, 2)  # [B, D, T]
-        out = torch.zeros_like(xt)
         T = xt.shape[-1]
-        for conv in self.convs:
-            y = conv(xt)[..., :T]  # 裁到原长
+        out = torch.zeros_like(xt)
+        for conv, d in zip(self.convs, self.dilations):
+            pad = (d * (self.kernel - 1), 0)    # 左填充, 右 0 (causal 关键)
+            y = F.pad(xt, pad)
+            y = conv(y)[..., :T]                # 输出长度裁回 T
             out = out + y
         return out.transpose(1, 2)
 
 
 class CashFlowTransformer(nn.Module):
+    """Decoder-only Transformer (与 PANTHER 主体架构对齐)。
+
+    架构要点：
+      · 自注意力恒走 causal mask (无条件，不再有 causal flag)
+      · SPRM 是 causal dilated conv, 与 attention 并联 (输出相加)，符合论文 §3.3
+        "Operating in parallel with the multi-head self-attention, the SPRM enhances
+         the final representation by adding its output to the Transformer's output"
+      · SFT / 预训练统一用 last-position hidden h[:, -1, :] 作为序列表示
+        (decoder-only 标准做法，与 next-token 预测读取最后一位置同构)
+    """
     def __init__(self, dim=256, depth=4, heads=8, n_products=64, dropout=0.2,
                  max_seq_len=512):
         super().__init__()
+        self.max_seq_len = max_seq_len
         self.token_emb = StructuredTokenEmbedding(dim=dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
         self.product_profile = nn.Embedding(n_products, dim)
@@ -306,22 +376,45 @@ class CashFlowTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(enc, num_layers=depth)
         self.sprm = SPRMConv(dim=dim)
         self.norm = nn.LayerNorm(dim)
-        # v4: 双路 (purchase / redemption) × 3 horizon = 6 维输出
+        # 回归头（SFT 用）：双路 (purchase / redemption) × 3 horizon = 6 维输出
         self.n_outputs = len(LABEL_KEYS) * len(HORIZONS)
         self.head = nn.Sequential(
             nn.Linear(dim, dim), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(dim, self.n_outputs)
         )
+        # 预训练头来对齐 PANTHER Eq.(4)：4 路 token 分类，预测下一笔 τ_{t+1}
+        #   direction (2: 申/赎) / amount_bin (16) / product_type (6: 0..5) / risk_level (6: 0..5)
+        # risk_level 用 6 类 (索引 0..5) 以同时容纳 xy 仿真的 R2 (=2) 和 akshare 的 R1..R5 (=1..5),
+        # 索引空间与 SFT 路径 daily["risk_level"].fillna(2) 一致 —— pretrained risk_emb 可直接迁移。
+        self.pt_heads = nn.ModuleDict({
+            "direction":    nn.Linear(dim, 2),
+            "amount_bin":   nn.Linear(dim, AMOUNT_BINS),
+            "product_type": nn.Linear(dim, 6),
+            "risk_level":   nn.Linear(dim, 6),
+        })
 
-    def forward(self, feat, pid_idx):
+    def forward(self, feat, pid_idx, mode="regress"):
+        """mode ∈ {'regress','pretrain'}:
+           - pretrain: 返回 4 路分类 logits dict, 每个 shape [B,T,V]。
+                       对位置 t 的 logits, 模型只能看到 τ_{1:t} (causal mask + causal SPRM)，
+                       shift 后做 τ_t → τ_{t+1} 预测 (在 _pretrain_loss 里做)
+           - regress:  返回 (logits_6d [B,6], pooled [B,dim])。pooled 用 last-position hidden
+                       + product profile (decoder-only 标准聚合方式)。
+        """
         B, T, _ = feat.shape
         tok = self.token_emb(feat[..., 0], feat[..., 1], feat[..., 2], feat[..., 3])
         pos = self.pos_emb(torch.arange(T, device=feat.device)).unsqueeze(0).expand(B, T, -1)
         x = tok + pos
-        h = self.transformer(x)
-        h = h + self.sprm(x)
+        mask = nn.Transformer.generate_square_subsequent_mask(T).to(feat.device)
+        h = self.transformer(x, mask=mask)
+        h = h + self.sprm(x)            # causal SPRM, 与 attention 并联
         h = self.norm(h)
-        pooled = h.mean(dim=1) + h[:, -1, :] + self.product_profile(pid_idx)
+
+        if mode == "pretrain":
+            return {name: head(h) for name, head in self.pt_heads.items()}
+
+        # decoder-only 标准聚合：last-position hidden (含全部历史信息) + product profile
+        pooled = h[:, -1, :] + self.product_profile(pid_idx)
         return self.head(pooled), pooled
 
 
@@ -329,7 +422,8 @@ class CashFlowTransformer(nn.Module):
 # 训练单 seed
 # ============================================================
 def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
-                   batch_size, dim, device, rank, world_size, amp):
+                   batch_size, dim, device, rank, world_size, amp,
+                   pretrain_ckpt=None):
     torch.manual_seed(seed); np.random.seed(seed)
     train_ds = CashFlowDataset(train_s, pid2idx)
     val_ds = CashFlowDataset(val_s, pid2idx)
@@ -347,6 +441,9 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
     test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2)
 
     model = CashFlowTransformer(dim=dim, n_products=max(len(pid2idx), 64)).to(device)
+    if pretrain_ckpt is not None:
+        backbone_tgt = model.module if hasattr(model, "module") else model
+        load_pretrain_backbone(backbone_tgt, pretrain_ckpt, rank=rank)
     if world_size > 1:
         model = DDP(model, device_ids=[rank])
 
@@ -439,6 +536,156 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
     return model, (preds if rank == 0 else None,
                    truths_arr if rank == 0 else None,
                    test_s if rank == 0 else None), history, best_val
+
+
+# ============================================================
+# PANTHER Stage-1：生成式预训练（下一笔行为 token 预测）
+# ============================================================
+# 损失权重：方向 / 金额桶权 1.0（信息量高）；
+#           type/risk 在 2 产品 xy 场景下是常量，给 0.3 权重避免退化为平凡 0-loss。
+PT_LOSS_WEIGHTS = {"direction": 1.0, "amount_bin": 1.0,
+                   "product_type": 0.3, "risk_level": 0.3}
+
+
+def _pretrain_loss(token_logits: dict, feats: torch.Tensor):
+    """4 路交叉熵求和。
+    token_logits[name] shape [B,T,V]；feats[..., k] 是 ground-truth token id。
+    做 t → t+1 shift：用位置 t 的 logits 预测位置 t+1 的 token（causal LM 标准做法）。
+    """
+    def shift(x):
+        return x[:, :-1]            # inputs: 位置 0..T-2 的预测
+    def shift_label(x):
+        return x[:, 1:]             # targets: 位置 1..T-1 的真实 token
+
+    col_map = {"direction": 0, "amount_bin": 1,
+               "product_type": 2, "risk_level": 3}
+    loss = 0.0
+    for name, w in PT_LOSS_WEIGHTS.items():
+        tgt = feats[..., col_map[name]].long()
+        # clamp 到合法词表范围 (防御 unify_corpus 偶发的越界值)
+        V = token_logits[name].shape[-1]
+        tgt = shift_label(tgt).clamp(0, V - 1)
+        logits = shift(token_logits[name])     # [B, T-1, V]
+        loss = loss + w * F.cross_entropy(
+            logits.reshape(-1, V), tgt.reshape(-1))
+    return loss
+
+
+def run_pretraining(*, corpus_path, epochs, lr, batch_size, dim, device,
+                    rank, world_size, amp, hist_len=30):
+    """Stage-1 生成式预训练：在无标签语料上学 τ = (dir, amt_bin, type, risk) 的下一笔预测。
+
+    输出：model_out/pretrain.ckpt （只保存 backbone: token_emb/pos_emb/transformer/
+          sprm/norm/product_profile；regression head 与 pt_heads 都跟 backbone 一起存,
+          SFT 时只加载 backbone 部分, head 重新随机初始化）。
+    """
+    print_rank0(f"\n==== Stage-1 生成式预训练 ====", rank)
+    print_rank0(f"  语料: {corpus_path}", rank)
+    ds = PretrainDataset(corpus_path, hist_len=hist_len)
+    print_rank0(f"  预训练样本数: {len(ds)} (滑窗 hist_len={hist_len})", rank)
+    if len(ds) == 0:
+        raise RuntimeError(f"预训练语料为空，请先跑 unify_corpus.py 生成 {corpus_path}")
+
+    sampler = None
+    shuffle = True
+    if world_size > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(ds)
+        shuffle = False
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler,
+                   num_workers=4, pin_memory=True, drop_last=True)
+
+    # pid → idx (用语料里出现过的所有 product_id 构造，给 product_profile 用)
+    pid2idx = {pid: i for i, pid in enumerate(sorted(set(ds.pids)))}
+    n_products = max(len(pid2idx), 64)
+
+    torch.manual_seed(0); np.random.seed(0)
+    model = CashFlowTransformer(dim=dim, n_products=n_products).to(device)
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = torch.amp.GradScaler('cuda') if (amp and device.type == "cuda") else None
+
+    best_loss = float("inf")
+    best_state = None
+    for ep in range(epochs):
+        model.train()
+        if sampler is not None:
+            sampler.set_epoch(ep)
+        ep_losses = []
+        for feats, pid in dl:
+            feats = feats.to(device, non_blocking=True)
+            # pid 是字符串 product_id 列表 (DataLoader 不 collate 成 tensor), 查 pid2idx 表得 idx
+            if isinstance(pid, torch.Tensor):
+                pid_list = pid.tolist()
+            else:
+                pid_list = list(pid)
+            pid_idx = torch.tensor([pid2idx[p] for p in pid_list],
+                                   dtype=torch.long, device=device)
+            if amp and device.type == "cuda":
+                with torch.amp.autocast('cuda'):
+                    token_logits = model(feats, pid_idx, mode="pretrain")
+                    loss = _pretrain_loss(token_logits, feats)
+                opt.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt); scaler.update()
+            else:
+                token_logits = model(feats, pid_idx, mode="pretrain")
+                loss = _pretrain_loss(token_logits, feats)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            ep_losses.append(loss.item())
+        mean_loss = float(np.mean(ep_losses)) if ep_losses else float("nan")
+        if world_size > 1:
+            mt = torch.tensor(mean_loss, device=device)
+            dist.all_reduce(mt, op=dist.ReduceOp.AVG); mean_loss = mt.item()
+        sched.step()
+        if mean_loss < best_loss - 1e-5:
+            best_loss = mean_loss
+            tgt = model.module if hasattr(model, "module") else model
+            best_state = {k: v.detach().cpu().clone() for k, v in tgt.state_dict().items()}
+        if rank == 0:
+            print(f"  [pretrain] epoch {ep+1:3d}/{epochs}  loss={mean_loss:.4f}  "
+                  f"best={best_loss:.4f}", flush=True)
+
+    if rank == 0 and best_state is not None:
+        ckpt_path = OUT_DIR / "pretrain.ckpt"
+        torch.save({"state_dict": best_state, "best_loss": best_loss,
+                    "dim": dim, "pid2idx": pid2idx}, ckpt_path)
+        print(f"  >> 预训练 ckpt 落: {ckpt_path} (best_loss={best_loss:.4f})")
+    return best_loss
+
+
+def load_pretrain_backbone(model: CashFlowTransformer, ckpt_path: str,
+                           rank: int = 0) -> CashFlowTransformer:
+    """SFT 续训：加载预训练 backbone 权重, 回归头 self.head 与 pt_heads 保留随机初始化。
+
+    加载策略 (strict=False + 名称前缀过滤):
+      ✓ 加载: token_emb.* / pos_emb.* / transformer.* / sprm.* / norm.* / product_profile.*
+      ✗ 跳过: head.* / pt_heads.*  (回归目标空间与预训练不同, 重头学)
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    src = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+    # 预训练 ckpt 里如果是 DDP 包装的, 去掉 'module.' 前缀
+    src = {k.removeprefix("module."): v for k, v in src.items()}
+    BACKBONE_PREFIXES = ("token_emb.", "pos_emb.", "transformer.",
+                         "sprm.", "norm.", "product_profile.")
+    backbone_only = {k: v for k, v in src.items() if k.startswith(BACKBONE_PREFIXES)}
+    missing, unexpected = model.load_state_dict(backbone_only, strict=False)
+    if rank == 0:
+        loaded = len(backbone_only) - len(unexpected)
+        total_backbone = sum(1 for k in model.state_dict()
+                             if k.startswith(BACKBONE_PREFIXES))
+        print(f"  [pretrain-ckpt] {ckpt_path}: 加载 {loaded}/{total_backbone} 个 backbone 参数, "
+              f"{len(unexpected)} 个预训练里有但当前模型没有, "
+              f"{sum(1 for m in missing if any(m.startswith(p) for p in BACKBONE_PREFIXES))} 个 backbone 参数仍是随机初始化 "
+              f"(通常是 n_products 不一致导致 product_profile 形状不匹配, 这种情况会自动用随机初始化也是安全的)")
+    return model
 
 
 # ============================================================
@@ -546,11 +793,36 @@ def main():
                     help="每个方法跑多少个不同 seed (取平均 ± std)")
     ap.add_argument("--hist-len", type=int, default=30)
     ap.add_argument("--no-amp", action="store_true", help="关闭混合精度")
+
+    # ===== PANTHER Stage-1 生成式预训练 =====
+    ap.add_argument("--pretrain", action="store_true",
+                    help="只跑 Stage-1 生成式预训练（产出 model_out/pretrain.ckpt），"
+                         "不进入下面的回归 SFT + 基线评估流程")
+    ap.add_argument("--pretrain-data", type=str, default=str(PRETRAIN_CORPUS),
+                    help=f"预训练语料 parquet 路径（默认 {PRETRAIN_CORPUS}；"
+                         f"由 unify_corpus.py 合并仿真放大 + akshare 真实基金产出）")
+    ap.add_argument("--pretrain-epochs", type=int, default=30,
+                    help="预训练 epoch 数（建议 20-40，causal LM 通常 30 内收敛）")
+
+    # ===== PANTHER Stage-2 SFT 续训 =====
+    ap.add_argument("--pretrain-ckpt", type=str, default=None,
+                    help="SFT 模式加载该预训练 ckpt 作为 backbone 初始化；"
+                         "不传则与原行为一致（从零监督训练）")
     args = ap.parse_args()
 
     rank, world_size, local_rank, is_dist = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     amp = (not args.no_amp) and device.type == "cuda"
+
+    # ===== Stage-1 短路：只跑预训练就退出 =====
+    if args.pretrain:
+        run_pretraining(corpus_path=args.pretrain_data,
+                        epochs=args.pretrain_epochs, lr=args.lr,
+                        batch_size=args.batch_size, dim=args.dim,
+                        device=device, rank=rank, world_size=world_size,
+                        amp=amp, hist_len=args.hist_len)
+        cleanup_distributed()
+        return 0
 
     print_rank0("\n==== 1. 加载 + 聚合 + 分桶 ====", rank)
     daily, meta = load_and_aggregate()
@@ -573,13 +845,16 @@ def main():
     val_s   = build_sequences(daily[daily["split"] == "val"],   args.hist_len)
     test_s  = build_sequences(daily[daily["split"] == "test"],  args.hist_len)
     print_rank0(f"  train={len(train_s)} val={len(val_s)} test={len(test_s)}", rank)
-    print_rank0(f"  (聚合粒度: 产品×group×日，样本量是 v3 产品×日的 ~{len(GROUPS) if 'GROUPS' in dir() else 4}x)", rank)
+    print_rank0(f"  (聚合粒度: 产品×group×日，4 个 group 让样本量是纯产品×日粒度的 ~4x)", rank)
     if len(train_s) < 1000:
         print_rank0(f"[WARN] train 样本仅 {len(train_s)}，Transformer 优势可能尚未展示；"
                     f"检查仿真是否真跑全量 (verify_data.py)", rank)
 
     pids = sorted({s["product_id"] for s in train_s + val_s + test_s})
     pid2idx = {p: i for i, p in enumerate(pids)}
+
+    if args.pretrain_ckpt:
+        print_rank0(f"\n==== SFT 模式：加载预训练 backbone {args.pretrain_ckpt} ====", rank)
 
     seeds_list = [hash(f"seed-{i}") % 100000 + 1 for i in range(args.seeds)]
 
@@ -597,6 +872,7 @@ def main():
             seed=seed, epochs=args.epochs, lr=args.lr,
             batch_size=args.batch_size, dim=args.dim,
             device=device, rank=rank, world_size=world_size, amp=amp,
+            pretrain_ckpt=args.pretrain_ckpt,
         )
         elapsed = time.time() - t0
         print_rank0(f"  elapsed: {elapsed:.1f}s, best_val={best_val:.4f}", rank)
@@ -667,6 +943,8 @@ def main():
                 "epochs": args.epochs, "hist_len": args.hist_len,
                 "world_size": world_size, "device": str(device),
                 "amp": amp,
+                "pretrain_ckpt": args.pretrain_ckpt,
+                "is_sft_mode": args.pretrain_ckpt is not None,
             }, f, ensure_ascii=False, indent=2)
 
         # 逐样本预测 dump（取 Transformer 最优 seed）—— v4: 6 维 label (pur×3 + red×3)
