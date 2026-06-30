@@ -99,18 +99,22 @@ cd xy-transformer
 
 PANTHER Stage-1 是**无监督**的，需要比 SFT 大得多的语料。本仓用 **放大仿真 + akshare 真实基金** 两条并行：
 
-### 1.1 放大仿真语料（主语料，~75 万笔）
+### 1.1 放大仿真语料（主语料，~7.7M 笔）
 
 ```bash
-python3 simulate_xy_real_schema.py --rate-multiplier 50 --years 3
+python3 simulate_xy_real_schema.py --rate-multiplier 5 --years 3
 ```
 
-把 `monthly_txn_rate` 整体 ×50（原本已经 12000/30000 → 60万/150万），3 年合计产出 ~75 万笔 xy schema 流水。
+把 `monthly_txn_rate` 整体 ×5（原本 12000/30000 → 6万/15万），3 年合计产出 **~7.7M 笔** xy schema 流水。
 落盘到 `data_sample/xy_txns.parquet`。
+
+> ⚠ **规模选择**：rate-multiplier 控制 pretrain 语料量。**不要用 rate-multiplier 50**——那会产出 76M 笔，
+> 单 epoch 在 3 卡 A800 上要几小时。推荐 5 (8M 笔) 起步；想更快收敛用 2 (~3M) 也够；要更大可用 10 (~15M)。
+> 默认 rate-multiplier=1 时是 ~1.5M 笔，对 pretrain 偏小但能跑通 smoke。
 
 **预期输出关键点**：
 ```
-流水总笔数: ~750,000（必须到几十万级，否则后续预训练语料不够）
+流水总笔数: ~7,700,000（应到百万级；几十万也行但 pretrain 收敛会慢一些）
 申/赎占比: 申 ~65% / 赎 ~35%
 ```
 
@@ -138,9 +142,9 @@ python3 unify_corpus.py
 
 **预期输出关键点**：
 ```
-[load] 仿真语料 ... → ~750,000 行
+[load] 仿真语料 ... → ~7,700,000 行
 [load] akshare 语料 ... → ~38,000 行
-总行数: ~790,000
+总行数: ~7,740,000
 direction: 申 ~65% / 赎 ~35%
 amount_bin 分布 (均匀为佳): {0: ..., 1: ..., ..., 15: ...}    ← 各桶笔数接近
 product_type 分布: {1: 大头(固收), 2: 中等(ETF 股基), ...}
@@ -164,7 +168,7 @@ PANTHER 两段式天然的隔离机制，本流程严格执行：
 
 | 阶段 | 数据 | 信号 |
 |---|---|---|
-| **Stage-1 预训练** | `pretrain_corpus.parquet`（75万仿真+38k ETF） | **只吃 4 维 token**（方向/金额桶/产品类型/风险等级），**不接触任何金额回归标签** |
+| **Stage-1 预训练** | `pretrain_corpus.parquet`（~7.7M 仿真 + 38k ETF） | **只吃 4 维 token**（方向/金额桶/产品类型/风险等级），**不接触任何金额回归标签** |
 | **Stage-2 SFT** | `xy_txns.parquet` 的时间切分 70/15/15（同 SFT 流程），n_train≈5-20k | 6 维 `log1p(purchase)/log1p(redemption)` × 3 horizon |
 
 预训练语料和 SFT 数据**在产品 ID 上可能重叠**（仿真语料用了相同的 9K.../9T... 产品），但这不是泄漏：
@@ -189,7 +193,7 @@ torchrun --nproc-per-node=3 --master-port=29500 train_xy_model.py \
 |---|---|---|
 | `--pretrain` | (flag) | 触发 Stage-1 短路：跑预训练然后退出，不进 SFT 评估流程 |
 | `--pretrain-data` | 默认值即可 | 上一 step 产出的统一语料 |
-| `--pretrain-epochs 30` | 20–40 | causal LM 在 75万+38k 语料上通常 20–30 内收敛 |
+| `--pretrain-epochs 30` | 20–40 | causal LM 在 ~7.7M+38k 语料上通常 20–30 内收敛 |
 | `--dim 256` | 256 | 与 Stage-2 SFT **必须一致**，否则 backbone 权重形状不匹配 |
 | `--batch-size 384` | 3 卡 × 128 | 8 卡可用 512 |
 | `--no-amp` | 默认开 AMP | 出 NaN 才关 |
@@ -349,7 +353,7 @@ git clone https://github.com/MiracleZ3/xy-transformer.git && cd xy-transformer &
 pip install torch numpy pandas openpyxl lightgbm matplotlib akshare && \
 export CUDA_VISIBLE_DEVICES=0,1,2 && \
 # Stage-1 语料
-python3 simulate_xy_real_schema.py --rate-multiplier 50 --years 3 && \
+python3 simulate_xy_real_schema.py --rate-multiplier 5 --years 3 && \
 python3 fetch_fund_flow.py --n-etfs 60 --years 3 && \
 python3 unify_corpus.py && \
 python3 verify_data.py && \

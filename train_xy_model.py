@@ -561,7 +561,9 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
         backbone_tgt = model.module if hasattr(model, "module") else model
         load_pretrain_backbone(backbone_tgt, pretrain_ckpt, rank=rank)
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        # find_unused_parameters: SFT forward 只走 self.head, pt_heads 不参与梯度;
+        # DDP 默认会让不参与梯度的参数报错 -> 必须开 find_unused_parameters=True
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -718,7 +720,9 @@ def run_pretraining(*, corpus_path, epochs, lr, batch_size, dim, device,
     torch.manual_seed(0); np.random.seed(0)
     model = CashFlowTransformer(dim=dim, n_products=n_products).to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        # find_unused_parameters: 预训练 forward 只走 pt_heads, self.head 不参与梯度;
+        # DDP 默认会让不参与梯度的参数报错 -> 必须开 find_unused_parameters=True
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
