@@ -10,12 +10,63 @@
 > 与 `docs/07-three-part-summary.md` 的当前结论 (LightGBM 6/6 WAPE 显著胜出，但 Transformer 方向命中率基本持平) 对齐；
 > 本轮目标是验证"加上 PANTHER Stage-1 预训练之后能否把误差棒收窄、方向命中率能否反超"。
 >
-> **模型架构（与 PANTHER 主体对齐，decoder-only）**：
-> - 自注意力恒走 causal mask（无开关，不是双向 encoder）
-> - SPRM 是 **causal** dilated conv（左 padding，只看历史），与 attention 并联、输出相加（论文 §3.3）
+> **模型架构（Llama3 风格 decoder + PANTHER 主体）**：
+> - 主体改用 **Llama3 组件**：RMSNorm（取代 LayerNorm）+ RoPE 旋转位置编码（取代绝对 pos_emb）
+>   + SwiGLU FFN（取代 GELU）+ causal SDPA（`is_causal=True` 内存高效路径）
+> - 自注意力恒走 causal mask（decoder-only，无开关）
+> - SPRM 是 **causal** dilated conv（左 padding，只看历史），与 attention 块顶层并联、输出相加（PANTHER §3.3）
 > - 回归头与预训练头都从最后一位置 hidden `h[:, -1, :]` 出发（decoder-only 标准聚合）
-> - 因此 Stage-1 / Stage-2 用同一份 backbone 拓扑，**不存在"预训练是 decoder、SFT 是 encoder"的架构错配**——
->   这是上一版（混合 encoder/decoder）的关键缺陷，本版已修正
+> - 本地已验证：RoPE 平移等变、各 block 与全模型 causal（扰动未来位置 → 过去位置输出 diff = 0）
+> - ⚠ **架构变更后老 ckpt 不可复用**：上一版用 `nn.TransformerEncoder` + pos_emb，本版用 LlamaBlock + RoPE，
+>   权重名称/形状都对不上。A800 上**必须重新跑 Stage-1 预训练**，不能加载上一版的 `model_out/pretrain.ckpt`
+
+---
+
+## Step −1：拉取新代码（每次代码更新都按这个走，**不会动 `model_out/` 训练产物**）
+
+`model_out/` 在 `.gitignore` 里，git **不会**碰它——`eval_summary.json` / `all_runs.jsonl` / `pretrain.ckpt` / `*.png`
+都安全。唯一可能挡住 `git pull` 的是 `data_sample/xy_txns.parquet` / `txns_real.parquet` 这两个**被跟踪**的小样本
+（如果你在 A800 上重跑过仿真/akshare，新版会盖掉它们，造成"本地修改与远程冲突"）。下面三段按你情况选一：
+
+### 如果只是想"先看看会不会冲突"（dry-run，不改任何文件）
+
+```bash
+cd xy-transformer
+git fetch origin
+git diff --stat HEAD origin/main      # 预览远程带来什么改动；输出空 = 已经最新
+git status                            # 看本地有没有未提交的脏改动
+```
+
+### 安全拉取（最稳，**保留 `model_out/` 不删**）
+
+```bash
+cd xy-transformer
+
+# 1) 把本地所有脏改动（含可能被改过的 data_sample/*.parquet）暂存隔离到 stash，**不删任何东西**
+git stash push -u -m "a800-local-changes-before-pull-$(date +%Y%m%d)"
+
+# 2) 此时工作区干净，git pull 丝滑通过
+git pull origin main
+
+# 3) (可选) 想看 stash 里存了什么：
+git stash list
+git stash show -p stash@{0}           # 看具体 diff
+# 想恢复某个 stash 的改动(比如你想保留某次跑出来的 config)：git stash pop  或 git checkout stash@{0} -- <file>
+```
+
+`stash` 是非破坏性的：默认的 `git stash` 不会清掉 `.gitignore` 里的文件（`model_out/`、`data_sample/pretrain_corpus.parquet`
+一直留在原地）；只有被 git **跟踪**的文件（`data_sample/*.parquet` 小样本 + 代码）改动会被暂存。
+
+### 如果完全确定要"清重跑"（激进：丢弃所有本地脏改动）
+
+```bash
+cd xy-transformer
+git fetch origin
+git reset --hard origin/main          # ⚠ 会丢弃所有跟踪文件的本地修改 (不清 model_out/)
+```
+
+> `model_out/` 由于 gitignore 保护，**任何**拉取姿势（包括 `reset --hard`）都不会动它。
+> 想清旧训练产物 → 在 §3 开跑前手动做：`mv model_out/* model_out_archive/ 2>/dev/null || true`。
 
 ---
 

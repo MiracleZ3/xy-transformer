@@ -320,6 +320,109 @@ class StructuredTokenEmbedding(nn.Module):
                 self.risk_emb(risk.long().clamp(0, 7)))
 
 
+# ============================================================
+# Llama3-style building blocks (RMSNorm / RoPE / SwiGLU / causal block)
+# ============================================================
+class RMSNorm(nn.Module):
+    """Llama 风格 RMSNorm: 去 mean、除 RMS, + 可学习缩放 eps 护底。"""
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        norm = x.float(). pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * norm).type_as(x) * self.weight
+
+
+def precompute_rope_cache(head_dim: int, max_seq_len: int, base: float = 10000.0,
+                          device=None, dtype=torch.float32):
+    """返回 cos/sin: [max_seq_len, head_dim/2] (按 Llama 实现, paired 维度)。
+
+    对 cos/sin 用 [len, hd/2] 后再 repeat_interleave 到 [len, hd] —— 与 apply_rope 配套。
+    """
+    half = head_dim // 2
+    freqs = 1.0 / (base ** (torch.arange(0, half, dtype=dtype, device=device) / half))
+    t = torch.arange(max_seq_len, dtype=dtype, device=device)
+    angles = torch.outer(t, freqs)                  # [T, hd/2]
+    return angles.cos(), angles.sin()
+
+
+def apply_rope(q, k, cos, sin):
+    """q,k: [B, H, T, hd]; cos/sin: [T, hd] (已 repeat_interleave 到 full head_dim)。
+
+    Llama 用 rotated half: 把最后一维拆两半互换做 (x1*cos - x2*sin, x1*sin + x2*cos)。
+    """
+    hd = q.shape[-1]
+    half = hd // 2
+    q1, q2 = q[..., :half], q[..., half:]
+    k1, k2 = k[..., :half], k[..., half:]
+    cos = cos[:, :half].unsqueeze(0).unsqueeze(0)   # [1,1,T,half]
+    sin = sin[:, :half].unsqueeze(0).unsqueeze(0)
+    q_rot = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
+    k_rot = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+    return q_rot, k_rot
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU FFN (Llama2/3 默认): w2(x) * silu(w1(x)) 形, 多 d_ff_hidden 维 + down 投回。
+
+    Llama3 用 SwiGLU = silu(w_gate(x)) * w_up(x), 再 w_down. hidden 通常 = (2/3)*4*dim, 圆整到 8 倍数.
+    """
+    def __init__(self, dim, hidden=None):
+        super().__init__()
+        if hidden is None:
+            hidden = int((2 / 3) * 4 * dim)
+            hidden = ((hidden + 7) // 8) * 8        # 圆整到 8 倍 (硬件友好, 也是 Llama 实践)
+        self.w_gate = nn.Linear(dim, hidden, bias=False)
+        self.w_up   = nn.Linear(dim, hidden, bias=False)
+        self.w_down = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x):
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
+
+class LlamaBlock(nn.Module):
+    """单个 Llama3 attention block (pre-norm + causal SDPA + RoPE) + SwiGLU FFN。"""
+    def __init__(self, dim, heads, dropout=0.0):
+        super().__init__()
+        assert dim % heads == 0, "dim must be divisible by heads"
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.nope_dim = 0   # 保留 GQA 接口位 (暂时全 head 都用 RoPE)
+        self.q_proj = nn.Linear(dim, heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(heads * self.head_dim, dim, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+        self.ffn = SwiGLU(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, cos=None, sin=None):
+        B, T, C = x.shape
+        h = self.norm1(x)
+        q = self.q_proj(h).view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        if cos is not None and sin is not None:
+            # cos/sin 是 [T, head_dim], repeat 到 full 然后进 apply_rope
+            cos_full = torch.repeat_interleave(cos[:T], 2, dim=-1)
+            sin_full = torch.repeat_interleave(sin[:T], 2, dim=-1)
+            q, k = apply_rope(q, k, cos_full, sin_full)
+        # causal SDPA: is_causal=True 走内存高效路径 (torch >= 2.0)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        x = x + self.drop(self.o_proj(out))
+        # FFN 残差
+        x = x + self.drop(self.ffn(self.norm2(x)))
+        return x
+
+
+
+
+
 class SPRMConv(nn.Module):
     """Causal (decoder-only) multi-scale dilated depthwise conv.
 
@@ -351,31 +454,43 @@ class SPRMConv(nn.Module):
 
 
 class CashFlowTransformer(nn.Module):
-    """Decoder-only Transformer (与 PANTHER 主体架构对齐)。
+    """Llama3-style decoder (RoPE + RMSNorm + SwiGLU + causal SDPA), PANTHER token + SPRM 顶层并联。
 
-    架构要点：
-      · 自注意力恒走 causal mask (无条件，不再有 causal flag)
-      · SPRM 是 causal dilated conv, 与 attention 并联 (输出相加)，符合论文 §3.3
-        "Operating in parallel with the multi-head self-attention, the SPRM enhances
-         the final representation by adding its output to the Transformer's output"
-      · SFT / 预训练统一用 last-position hidden h[:, -1, :] 作为序列表示
-        (decoder-only 标准做法，与 next-token 预测读取最后一位置同构)
+    架构要点 (现代 Llama3 组件 × PANTHER 主体结构):
+      · 结构化分词 token emb (PANTHER Eq.4): 4 维笛卡尔积, 4 个 emb 相加
+      · 位置编码用 **RoPE** 旋转矩阵 (取代绝对 pos_emb), 编码相对位置
+      · 多层 **LlamaBlock**: RMSNorm pre-norm + causal scaled-dot-product attention + SwiGLU FFN
+      · **SPRM** causal dilated conv 与 transformer 顶层并联, 输出相加 (PANTHER §3.3 原文
+        "Operating in parallel with the multi-head self-attention ... adding its output")
+      · 输入侧用一个 RMSNorm 做最终 norm (取代 LayerNorm, 对齐 Llama 实践)
+      · 回归/预训练头都从 last-position hidden h[:,-1,:] 出发 (decoder-only 标准聚合)
+
+    与 nn.TransformerEncoder 旧实现的关键差异:
+      - 残差路径去掉 LayerNorm -> RMSNorm (无 mean-centering, 数值更稳)
+      - 注意力走 SDPA is_causal=True (内存高效, 不再构造 [T,T] mask)
+      - FFN 从 GELU+Linear 改 SwiGLU (silu gate, 通常 +1~2% 下游精度)
     """
     def __init__(self, dim=256, depth=4, heads=8, n_products=64, dropout=0.2,
-                 max_seq_len=512):
+                 max_seq_len=512, rope_base=10000.0):
         super().__init__()
+        assert dim % heads == 0, f"dim={dim} 必须能被 heads={heads} 整除 (RoPE 要求)"
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
         self.max_seq_len = max_seq_len
         self.token_emb = StructuredTokenEmbedding(dim=dim)
-        self.pos_emb = nn.Embedding(max_seq_len, dim)
-        self.product_profile = nn.Embedding(n_products, dim)
+        # 不再有 self.pos_emb; 用 RoPE 在 attention 内旋转 q/k. 预计算 cos/sin 缓存.
+        cos, sin = precompute_rope_cache(self.head_dim, max_seq_len, base=rope_base)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
-        enc = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads, dim_feedforward=dim * 4,
-            dropout=dropout, batch_first=True, activation="gelu"
-        )
-        self.transformer = nn.TransformerEncoder(enc, num_layers=depth)
+        self.blocks = nn.ModuleList([
+            LlamaBlock(dim=dim, heads=heads, dropout=dropout)
+            for _ in range(depth)
+        ])
         self.sprm = SPRMConv(dim=dim)
-        self.norm = nn.LayerNorm(dim)
+        self.norm = RMSNorm(dim)        # 最终 norm 用 RMSNorm (取代 LayerNorm)
+        self.product_profile = nn.Embedding(n_products, dim)
         # 回归头（SFT 用）：双路 (purchase / redemption) × 3 horizon = 6 维输出
         self.n_outputs = len(LABEL_KEYS) * len(HORIZONS)
         self.head = nn.Sequential(
@@ -396,18 +511,18 @@ class CashFlowTransformer(nn.Module):
     def forward(self, feat, pid_idx, mode="regress"):
         """mode ∈ {'regress','pretrain'}:
            - pretrain: 返回 4 路分类 logits dict, 每个 shape [B,T,V]。
-                       对位置 t 的 logits, 模型只能看到 τ_{1:t} (causal mask + causal SPRM)，
+                       对位置 t 的 logits, 模型只能看到 τ_{1:t} (causal attention + causal SPRM)，
                        shift 后做 τ_t → τ_{t+1} 预测 (在 _pretrain_loss 里做)
            - regress:  返回 (logits_6d [B,6], pooled [B,dim])。pooled 用 last-position hidden
                        + product profile (decoder-only 标准聚合方式)。
         """
         B, T, _ = feat.shape
-        tok = self.token_emb(feat[..., 0], feat[..., 1], feat[..., 2], feat[..., 3])
-        pos = self.pos_emb(torch.arange(T, device=feat.device)).unsqueeze(0).expand(B, T, -1)
-        x = tok + pos
-        mask = nn.Transformer.generate_square_subsequent_mask(T).to(feat.device)
-        h = self.transformer(x, mask=mask)
-        h = h + self.sprm(x)            # causal SPRM, 与 attention 并联
+        x = self.token_emb(feat[..., 0], feat[..., 1], feat[..., 2], feat[..., 3])
+        # Llama3 block 堆栈: 内部已含 RoPE 旋转 + causal SDPA + SwiGLU + 残差
+        h = x
+        for blk in self.blocks:
+            h = blk(h, cos=self.rope_cos, sin=self.rope_sin)
+        h = h + self.sprm(x)            # causal SPRM 顶层并联 (PANTHER §3.3)
         h = self.norm(h)
 
         if mode == "pretrain":
@@ -666,14 +781,18 @@ def load_pretrain_backbone(model: CashFlowTransformer, ckpt_path: str,
     """SFT 续训：加载预训练 backbone 权重, 回归头 self.head 与 pt_heads 保留随机初始化。
 
     加载策略 (strict=False + 名称前缀过滤):
-      ✓ 加载: token_emb.* / pos_emb.* / transformer.* / sprm.* / norm.* / product_profile.*
+      ✓ 加载: token_emb.* / blocks.* (LlamaBlocks) / sprm.* / norm.* / product_profile.*
+              (以及 rope_cos/rope_sin register_buffer 不需加载, persistent=False 已经不进 ckpt)
       ✗ 跳过: head.* / pt_heads.*  (回归目标空间与预训练不同, 重头学)
+      历史兼容: 旧 ckpt 用 transformer.* 命名, 此处会显示该部分骨干随机初始化 —— 由于 ckpt
+              形状也对不上 (旧 /transformer.* 是 nn.TransformerEncoderLayer, 新 /blocks.*
+              是 LlamaBlock), 旧 ckpt **不能复用**, 必须重新预训练.
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     src = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     # 预训练 ckpt 里如果是 DDP 包装的, 去掉 'module.' 前缀
     src = {k.removeprefix("module."): v for k, v in src.items()}
-    BACKBONE_PREFIXES = ("token_emb.", "pos_emb.", "transformer.",
+    BACKBONE_PREFIXES = ("token_emb.", "blocks.",
                          "sprm.", "norm.", "product_profile.")
     backbone_only = {k: v for k, v in src.items() if k.startswith(BACKBONE_PREFIXES)}
     missing, unexpected = model.load_state_dict(backbone_only, strict=False)

@@ -180,12 +180,22 @@ depthwise dilated conv，kernel=3，dilations = (1, 2, 4)，causal 左 padding
 
 SPRM 与多头自注意力**并联**（输出相加），且必须是 **causal 卷积**——在 decoder-only 框架下，
 若卷积双向，位置 t 的感受野会泄漏 t+1 等未来 token，破坏 next-token 预测。本实现用左 padding
-`(d*(kernel-1), 0)` 保证位置 t 只看 τ_{1:t}：
+`(d*(kernel-1), 0)` 保证位置 t 只看 τ_{1:t}。SPRM 与 Llama3 block 堆栈的顶层输出相加：
 
 ```python
-h = transformer(x, mask=causal_mask)   # decoder-only self-attention
-h = h + sprm(x)                         # + causal 多尺度周期归纳偏置 (并联)
+# Llama3 风格主体：RMSNorm + RoPE + SwiGLU + causal SDPA (内部每层已含残差)
+h = x
+for blk in self.blocks:
+    h = blk(h, cos=rope_cos, sin=rope_sin)
+# PANTHER §3.3 顶层并联：SPRM 取未进 block 的 token emb, 与 attention 输出相加
+h = h + self.sprm(x)
+h = self.norm(h)            # RMSNorm 最终归一
 ```
+
+> **主体升级为 Llama3 风格**：本版的 attention block 不再是 `nn.TransformerEncoderLayer`，而是
+> 手写的 LlamaBlock ——（1）RMSNorm 替代 LayerNorm（无 mean 中心化，数值更稳），（2）RoPE 旋转位置
+> 编码替代绝对 `pos_emb`（编码相对位置，外推性更好），（3）SwiGLU FFN 取代 GELU+Linear（silu 门控，
+> 通常 +1~2% 下游精度），（4）注意力走 `scaled_dot_product_attention(is_causal=True)` 内存高效路径。
 
 这是 PANTHER 区别于一般 Transformer 的关键创新——**显式注入"资金流有周期性"的领域知识**，
 让模型不需要从数据从头学周期规律，而是直接被赋予。在我们这种 3 年数据的中小规模场景下，
