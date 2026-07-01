@@ -285,17 +285,23 @@ class PretrainDataset(Dataset):
             if c not in df.columns:
                 df[c] = 0.0
 
-        # 按 product_id (跨 group) 打成长序列 —— PANTHER 的行为序列打包
+        # 按 (product_id, group_id, direction) 打成长序列 —— 保留 AR(1) 信号
+        # 关键: AR(1) 自相关是在每个 (product×group×direction) 子序列内注入的 (见 unify_corpus.py);
+        # 若跨 group/direction 合并, 相邻位置可能跨子序列, 自相关从 ~0.7 衰减到 ~0.1 (实测)。
         self.sequences = []
         self.pids = []
-        for pid, g in df.sort_values(["product_id", "date"]).groupby("product_id", sort=False):
+        seq_keys = ["product_id"]
+        if "group_id" in df.columns:
+            seq_keys += ["group_id"]
+        seq_keys += ["direction"]
+        for keyvals, g in df.sort_values(seq_keys + ["date"]).groupby(seq_keys, sort=False):
             feats = g[self.columns + ["n_txn", "yield_rate"]].values.astype("float32")
             if len(feats) < hist_len + 1:
                 continue
             # 滑窗切片，每个窗口 hist_len 长度
             for t in range(0, len(feats) - hist_len):
                 self.sequences.append(feats[t:t + hist_len])
-                self.pids.append(pid)
+                self.pids.append(keyvals[0])   # product_id 是分组键元组首元素
 
     def __len__(self):
         return len(self.sequences)
@@ -659,10 +665,13 @@ def train_one_seed(train_s, val_s, test_s, pid2idx, *, seed, epochs, lr,
 # ============================================================
 # PANTHER Stage-1：生成式预训练（下一笔行为 token 预测）
 # ============================================================
-# 损失权重：方向 / 金额桶权 1.0（信息量高）；
-#           type/risk 在 2 产品 xy 场景下是常量，给 0.3 权重避免退化为平凡 0-loss。
-PT_LOSS_WEIGHTS = {"direction": 1.0, "amount_bin": 1.0,
-                   "product_type": 0.3, "risk_level": 0.3}
+# 损失权重：方向维权 1.0（信息量高、对下游方向预测最关键）；
+#           amount_bin 权 0.3 —— 仿真里每笔 amount 是独立 lognormal 抽样，
+#               amount_bin（16 桶）几乎不可预测（盲猜基线 log16=2.77），给它 1.0 会浪费模型容量；
+#               若配合 simulate_xy_real_schema.py 的 AR(1) 改造让 amount 可学，可调回 1.0。
+#           type/risk 在 2 产品 xy 场景下基本是常量，给 0.1 权重避免退化为平凡 0-loss。
+PT_LOSS_WEIGHTS = {"direction": 1.0, "amount_bin": 0.3,
+                   "product_type": 0.1, "risk_level": 0.1}
 
 
 def _pretrain_loss(token_logits: dict, feats: torch.Tensor):

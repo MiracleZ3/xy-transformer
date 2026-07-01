@@ -147,6 +147,9 @@ def simulate_product(pid: str, meta: dict, base_date: pd.Timestamp, n_days: int)
     mu_eff = np.array([meta["mu_amount_log"] + GROUPS[int(g)]["mu_delta"] for g in group_array])
     sigma_eff = np.array([meta["sigma_amount"] * GROUPS[int(g)]["sigma_mult"] for g in group_array])
     # lognormal 逐样本 + v5(1)趋势因子 = mu + sigma*standard_normal + log(trend)
+    # 注: 逐笔 amount 是独立采样, 不在此注入 AR(1) 自相关 —— 因为下游 SFT 用的是
+    # (产品×group×日) 的日级 sum 聚合, 逐笔 AR(1) 经聚合后自相关会从 0.7 衰减到 ~0.1 (实测)。
+    # 日级金额的簇结构 (AR(1)) 在 unify_corpus.py 的日级聚合步骤里注入, 对齐下游粒度。
     z = _RNG.standard_normal(n_txn)
     amount = np.exp(mu_eff + sigma_eff * z) * trend_factor
     amount = np.minimum(amount, 10_000_000.0).astype(np.float64)
